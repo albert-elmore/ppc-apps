@@ -2,19 +2,6 @@
 
 Experimental music and utility applications for **Macintosh G3 (PowerPC)** running **Mac OS 9**. Sources are written in C for **Metrowerks CodeWarrior** as self-contained, single-file programs (add one `.c` file per target—no external dependencies beyond the classic Mac OS SDK).
 
-## Applications
-
-| App | Source | Description |
-|-----|--------|-------------|
-| [Osc40](apps/osc40/) | `apps/osc40/src/osc40.c` | Forty-oscillator composition tool with randomized note drift and extensive performance controls. |
-| [Noise Lab](apps/noise-lab/) | `apps/noise-lab/src/noise-lab.c` | Percussion-oriented waveform designer for building drum-like samples. |
-| [Media Player](apps/media-player/) | `apps/media-player/src/media-player.c` | Multi-deck WAV player (“G3 Stage Player”) with CDJ-style features and more. |
-| [Granular](apps/granular/) | `apps/granular/src/granular.c` | Granular synthesis instrument (in active development). |
-| [Event Sequencer](apps/event-sequencer/) | `apps/event-sequencer/src/event-sequencer.c` | TidalCycles-inspired text language for patterns on this platform. |
-| [CPU Monitor](apps/cpu-monitor/) | `apps/cpu-monitor/src/cpu-monitor.c` | CPU load meter for profiling apps on real hardware. |
-
-Each app has its own `README.md` under `apps/<name>/` with build notes.
-
 ## Target platform
 
 - **Hardware:** Power Macintosh G3 (and similar PowerPC Macs)
