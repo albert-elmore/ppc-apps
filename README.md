@@ -23,28 +23,6 @@ Each app has its own `README.md` under `apps/<name>/` with build notes.
 
 Open `apps/<name>/src/<name>.c` in a new CodeWarrior project (one source file per target). There is no shared build system yet.
 
-## Repository layout
-
-```text
-ppc-apps/
-├── README.md
-├── LICENSE
-├── apps/
-│   ├── osc40/
-│   │   ├── README.md
-│   │   └── src/
-│   │       └── osc40.c
-│   ├── noise-lab/
-│   ├── media-player/
-│   ├── granular/
-│   ├── event-sequencer/
-│   └── cpu-monitor/
-├── common/              # future: shared headers, audio helpers
-└── docs/                # future: screenshots, language spec
-```
-
-**Versioning:** use git tags per app (e.g. `osc40/v1.0`, `noise-lab/v1.3`), not version suffixes in filenames.
-
 ## Status
 
 Early/experimental. Event Sequencer’s language and Granular’s feature set are still evolving.
