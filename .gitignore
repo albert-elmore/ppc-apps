@@ -1,0 +1,11 @@
+# CodeWarrior / Mac OS build artifacts
+*.o
+*.obj
+*.ppc
+*.sym
+*.xSYM
+*.cwdebug
+*.mcp.backup
+
+# Classic Mac applications (build locally)
+*.app
