@@ -15,5 +15,5 @@ Open `apps/<name>/src/<name>.c` in a new CodeWarrior project (one source file pe
 Early/experimental. Event Sequencer’s language and Granular’s feature set are still evolving.
 
 ## License
-
+ 
 GPL-3.0 — see [LICENSE](LICENSE).
