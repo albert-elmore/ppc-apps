@@ -11,7 +11,9 @@ Granular synthesis instrument (in active development). Ergonomic performance con
 - **W** — same as the Assign button.
 - On load, the default loop window end is **2000 ms** into the file.
 - **Escape** — cancels assign mode without saving.
-- **Stop** — use the Stop button (not a keyboard key; `s` is a preset slot).
+- **Play/Stop** — one button toggles transport (label shows Play or Stop). **Space** toggles the same way.
+- **Play/Stop Fade** — slider sets fade-in and fade-out time from 0 ms to 16 s (default ~200 ms) on output volume when starting or stopping.
+- **Pitch Glide** — slider sets how long pitch changes take from 0 ms (instant) to 16 s. Applies to the Pitch and Fine Tune sliders; active grains follow the glide.
 
 ## Build
 

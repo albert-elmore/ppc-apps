@@ -18,7 +18,9 @@
 #include <stdlib.h>
 
 #define kWindowWidth          820
-#define kWindowHeight         718
+#define kWindowHeight         810
+#define kPlayFadeMSMax        16000L
+#define kPitchGlideMSMax      16000L
 
 #define kLoadLeft             20
 #define kLoadTop              50
@@ -30,17 +32,13 @@
 #define kPlayWidth            96
 #define kPlayHeight           24
 
-#define kStopLeft             244
-#define kStopTop              50
-#define kStopWidth            96
-
-#define kResetPitchLeft       356
+#define kResetPitchLeft       244
 #define kResetPitchTop        50
 #define kResetPitchWidth      120
 #define kResetPitchHeight     24
 #define kStopHeight           24
 
-#define kFadeModeTop          646
+#define kFadeModeTop          738
 #define kFadeModeLeft         20
 #define kFadeModeWidth        200
 #define kFadeModeHeight         20
@@ -51,7 +49,7 @@
 #define kAssignHeight         24
 
 #define kQuitLeft             720
-#define kQuitTop              684
+#define kQuitTop              776
 #define kQuitWidth            80
 #define kQuitHeight           24
 
@@ -76,8 +74,10 @@
 #define kPitchSliderTop       482
 #define kFineSliderTop        526
 #define kPresetFadeSliderTop  570
-#define kPresetHintTop        618
-#define kPresetHintLine2      632
+#define kPlayFadeSliderTop    614
+#define kPitchGlideSliderTop  658
+#define kPresetHintTop        706
+#define kPresetHintLine2      720
 
 #define kPresetCount          16
 #define kPresetFadeMSMax      6000L
@@ -129,7 +129,6 @@ static Boolean        gDone = false;
 
 static Rect           gLoadRect;
 static Rect           gPlayRect;
-static Rect           gStopRect;
 static Rect           gResetPitchRect;
 static Rect           gAssignRect;
 static Rect           gQuitRect;
@@ -137,7 +136,6 @@ static Rect           gWaveRect;
 
 static ControlHandle  gLoadButton = NULL;
 static ControlHandle  gPlayButton = NULL;
-static ControlHandle  gStopButton = NULL;
 static ControlHandle  gResetPitchButton = NULL;
 static ControlHandle  gAssignButton = NULL;
 static ControlHandle  gQuitButton = NULL;
@@ -151,6 +149,8 @@ static ControlHandle  gGainControl = NULL;
 static ControlHandle  gPitchControl = NULL;
 static ControlHandle  gFineTuneControl = NULL;
 static ControlHandle  gPresetFadeControl = NULL;
+static ControlHandle  gPlayFadeControl = NULL;
+static ControlHandle  gPitchGlideControl = NULL;
 static ControlHandle  gFadeModeButton = NULL;
 static Rect           gFadeModeRect;
 
@@ -226,8 +226,17 @@ static long           gGrainRateNorm = 126;  /* 26 ms */
 static long           gGainNorm = 500;       /* 100% */
 static long           gPitchNorm = 500;      /* 0 semitones */
 static long           gFineTuneNorm = 500;   /* 0 cents */
+static long           gPlayFadeNorm = 25;    /* ~200 ms at 16 s max */
+static long           gPitchGlideNorm = 25;
 
 static volatile Boolean gEnginePlaying = false;
+static Boolean          gTransportPlaying = false;
+static volatile long    gPlayFadeGain256 = 0;
+static long             gPlayFadeStartGain256 = 0;
+static long             gPlayFadeTargetGain256 = 256;
+static long             gPlayFadeFramesTotal = 1;
+static long             gPlayFadeFramesLeft = 0;
+static long             gPlayFadeMS = 200;
 static volatile Boolean gEngineRunning = false;
 static volatile long    gLoopStartFrame = 0;
 static volatile long    gLoopEndFrame = 1;
@@ -236,6 +245,11 @@ static volatile long    gGrainRateFrames = 441;
 static volatile long    gFramesUntilNextGrain = 0;
 static volatile long    gOutputGain256 = 256;
 static volatile unsigned long gPitchStep16 = 65536UL;
+static volatile unsigned long gPitchTargetStep16 = 65536UL;
+static unsigned long    gPitchGlideStartStep16 = 65536UL;
+static long             gPitchGlideFramesTotal = 1;
+static long             gPitchGlideFramesLeft = 0;
+static long             gPitchGlideMS = 200;
 static volatile long    gEffectiveGrainRateFrames = 441;
 static Boolean          gSafetyClampActive = false;
 
@@ -287,6 +301,25 @@ static void FormatGainValue(Str255 out);
 static void FormatPitchValue(Str255 out);
 static void FormatFineTuneValue(Str255 out);
 static void FormatPresetFadeValue(Str255 out);
+static void FormatPlayFadeValue(Str255 out);
+static void FormatPitchGlideValue(Str255 out);
+static long PlayFadeMSFromNorm(long normValue);
+static long PitchGlideMSFromNorm(long normValue);
+static void ApplyPlayFadeNorm(void);
+static void ApplyPitchGlideNorm(void);
+static unsigned long PitchTargetStep16FromControls(void);
+static void SetPitchTargetFromControls(void);
+static void AdvancePitchGlide(long frames);
+static void ApplyPitchStepToActiveGrains(void);
+static void AdvancePlayFade(long frames);
+static void BeginPlayFadeTo(long targetGain256);
+static void RequestStartPlay(void);
+static void RequestStopPlay(void);
+static void StopAudioEngineImmediate(void);
+static void DrawPlayStopButton(void);
+static void UpdatePlayStopButton(void);
+static void TogglePlayStop(void);
+static void DispatchEvent(EventRecord *event);
 static void DrawPresetHint(void);
 static void DrawFadeModeRow(void);
 static void ToggleFadeModeControl(void);
@@ -455,14 +488,34 @@ static void DrawWaveformStatusOnly(void)
     else DrawString("\pLoad a WAV to see waveform");
 }
 
+static void DispatchEvent(EventRecord *event)
+{
+    if (event == NULL) return;
+
+    switch (event->what) {
+        case mouseDown:
+            HandleMouseDown(event);
+            break;
+        case updateEvt:
+            if ((WindowPtr)event->message == gWindow) {
+                HandleUpdate(event);
+            }
+            break;
+        case keyDown:
+        case autoKey:
+            HandleKeyDown(event);
+            break;
+        default:
+            break;
+    }
+}
+
 static void PumpEvents(void)
 {
     EventRecord event;
 
     while (WaitNextEvent(everyEvent, &event, 0, NULL)) {
-        if (event.what == updateEvt && (WindowPtr)event.message == gWindow) {
-            HandleUpdate(&event);
-        }
+        DispatchEvent(&event);
     }
 }
 
@@ -476,9 +529,7 @@ static void ServiceUI(void)
         DrawActivityOnly();
     }
     while (WaitNextEvent(everyEvent, &event, 0, NULL)) {
-        if (event.what == updateEvt && (WindowPtr)event.message == gWindow) {
-            HandleUpdate(&event);
-        }
+        DispatchEvent(&event);
     }
 }
 
@@ -971,6 +1022,276 @@ static long PresetFadeMSFromNorm(long normValue)
     return (normValue * kPresetFadeMSMax) / kSliderMax;
 }
 
+static long PlayFadeMSFromNorm(long normValue)
+{
+    return (normValue * kPlayFadeMSMax) / kSliderMax;
+}
+
+static long PitchGlideMSFromNorm(long normValue)
+{
+    return (normValue * kPitchGlideMSMax) / kSliderMax;
+}
+
+static void ApplyPlayFadeNorm(void)
+{
+    gPlayFadeMS = PlayFadeMSFromNorm(gPlayFadeNorm);
+}
+
+static void ApplyPitchGlideNorm(void)
+{
+    gPitchGlideMS = PitchGlideMSFromNorm(gPitchGlideNorm);
+}
+
+static unsigned long PitchTargetStep16FromControls(void)
+{
+    double pitchRatio;
+    double semis;
+    unsigned long step16;
+
+    semis = (double)PitchSemitonesFromNorm(gPitchNorm) +
+        ((double)FineTuneCentsFromNorm(gFineTuneNorm) / 100.0);
+    pitchRatio = pow(2.0, semis / 12.0);
+    if (pitchRatio < 0.25) pitchRatio = 0.25;
+    if (pitchRatio > 4.0) pitchRatio = 4.0;
+    step16 = (unsigned long)(pitchRatio * 65536.0 + 0.5);
+    if (step16 < 1UL) step16 = 1UL;
+    return step16;
+}
+
+static long PitchGlideFramesFromMS(void)
+{
+    long frames;
+
+    if (!gSample.loaded || gSample.sampleRate == 0 || gPitchGlideMS <= 0L) return 0L;
+    frames = (gPitchGlideMS * (long)gSample.sampleRate) / 1000L;
+    if (frames < 1L) frames = 1L;
+    return frames;
+}
+
+static void ApplyPitchStepToActiveGrains(void)
+{
+    short g;
+    unsigned long step = gPitchStep16;
+
+    for (g = 0; g < kMaxGrains; g++) {
+        if (gGrains[g].active) {
+            gGrains[g].phaseStep16 = step;
+        }
+    }
+}
+
+static void AdvancePitchGlide(long frames)
+{
+    long tDen;
+    long tNum;
+    long startStep;
+    long targetStep;
+    long delta;
+    long newStep;
+
+    if (gPitchGlideFramesLeft <= 0L) return;
+    if (frames < 1L) frames = 1L;
+    if (frames >= gPitchGlideFramesLeft) frames = gPitchGlideFramesLeft;
+
+    gPitchGlideFramesLeft -= frames;
+    tDen = gPitchGlideFramesTotal;
+    if (tDen < 1L) tDen = 1L;
+    tNum = tDen - gPitchGlideFramesLeft;
+
+    startStep = (long)gPitchGlideStartStep16;
+    targetStep = (long)gPitchTargetStep16;
+    delta = targetStep - startStep;
+    newStep = startStep + (tNum * delta) / tDen;
+    if (newStep < 1L) newStep = 1L;
+    gPitchStep16 = (unsigned long)newStep;
+
+    if (gPitchGlideFramesLeft <= 0L) {
+        gPitchStep16 = gPitchTargetStep16;
+    }
+    ApplyPitchStepToActiveGrains();
+}
+
+static void SetPitchTargetFromControls(void)
+{
+    unsigned long newTarget;
+    long glideFrames;
+
+    newTarget = PitchTargetStep16FromControls();
+    gPitchTargetStep16 = newTarget;
+
+    glideFrames = PitchGlideFramesFromMS();
+    if (glideFrames <= 0L || newTarget == gPitchStep16) {
+        gPitchStep16 = newTarget;
+        gPitchGlideFramesLeft = 0L;
+        ApplyPitchStepToActiveGrains();
+        return;
+    }
+
+    gPitchGlideStartStep16 = gPitchStep16;
+    gPitchGlideFramesTotal = glideFrames;
+    gPitchGlideFramesLeft = glideFrames;
+}
+
+static long PlayFadeFramesFromMS(void)
+{
+    long frames;
+
+    if (!gSample.loaded || gSample.sampleRate == 0 || gPlayFadeMS <= 0L) return 0L;
+    frames = (gPlayFadeMS * (long)gSample.sampleRate) / 1000L;
+    if (frames < 1L) frames = 1L;
+    return frames;
+}
+
+static void AdvancePlayFade(long frames)
+{
+    long tDen;
+    long tNum;
+    long delta;
+
+    if (gPlayFadeFramesLeft <= 0L) return;
+    if (frames < 1L) frames = 1L;
+    if (frames >= gPlayFadeFramesLeft) frames = gPlayFadeFramesLeft;
+
+    gPlayFadeFramesLeft -= frames;
+    tDen = gPlayFadeFramesTotal;
+    if (tDen < 1L) tDen = 1L;
+    tNum = tDen - gPlayFadeFramesLeft;
+
+    delta = gPlayFadeTargetGain256 - gPlayFadeStartGain256;
+    gPlayFadeGain256 = gPlayFadeStartGain256 + (tNum * delta) / tDen;
+
+    if (gPlayFadeFramesLeft <= 0L) {
+        gPlayFadeGain256 = gPlayFadeTargetGain256;
+        if (gPlayFadeTargetGain256 <= 0L) {
+            StopAudioEngineImmediate();
+        }
+    }
+}
+
+static void BeginPlayFadeTo(long targetGain256)
+{
+    long fadeFrames;
+    long current;
+
+    if (targetGain256 < 0L) targetGain256 = 0L;
+    if (targetGain256 > 256L) targetGain256 = 256L;
+
+    current = gPlayFadeGain256;
+    if (current < 0L) current = 0L;
+    if (current > 256L) current = 256L;
+
+    fadeFrames = PlayFadeFramesFromMS();
+    if (fadeFrames <= 0L || current == targetGain256) {
+        gPlayFadeGain256 = targetGain256;
+        gPlayFadeFramesLeft = 0L;
+        if (targetGain256 <= 0L && gEnginePlaying) {
+            StopAudioEngineImmediate();
+        }
+        return;
+    }
+
+    gPlayFadeStartGain256 = current;
+    gPlayFadeTargetGain256 = targetGain256;
+    gPlayFadeFramesTotal = fadeFrames;
+    gPlayFadeFramesLeft = fadeFrames;
+}
+
+static void DrawPlayStopButton(void)
+{
+    Str255 label;
+    short labelWidth;
+    short x;
+    short y;
+
+    if (gPlayButton == NULL || gWindow == NULL) return;
+
+    Draw1Control(gPlayButton);
+
+    if (gTransportPlaying) {
+        CopyPString("\pStop", label);
+    } else {
+        CopyPString("\pPlay", label);
+    }
+
+    TextFace(bold);
+    labelWidth = StringWidthP(label);
+    x = (short)(gPlayRect.left + ((gPlayRect.right - gPlayRect.left) - labelWidth) / 2);
+    y = (short)(gPlayRect.top + ((gPlayRect.bottom - gPlayRect.top + 10) / 2) - 2);
+    MoveTo(x, y);
+    DrawString(label);
+    TextFace(0);
+}
+
+static void UpdatePlayStopButton(void)
+{
+    if (gWindow == NULL) return;
+    SetPort(gWindow);
+    InvalRect(&gPlayRect);
+}
+
+static void StopAudioEngineImmediate(void)
+{
+    SndCommand cmd;
+
+    gPlayFadeFramesLeft = 0L;
+    gPlayFadeGain256 = 0L;
+    gEnginePlaying = false;
+    gTransportPlaying = false;
+
+    if (gChannel != NULL) {
+        cmd.cmd = quietCmd;
+        cmd.param1 = 0;
+        cmd.param2 = 0;
+        SndDoImmediate(gChannel, &cmd);
+        cmd.cmd = flushCmd;
+        SndDoImmediate(gChannel, &cmd);
+    }
+    UpdatePlayStopButton();
+}
+
+static void RequestStopPlay(void)
+{
+    if (!gEnginePlaying) return;
+    BeginPlayFadeTo(0L);
+}
+
+static void RequestStartPlay(void)
+{
+    OSErr err;
+
+    if (!gSample.loaded || !gEngineRunning) return;
+
+    if (!gEnginePlaying) {
+        err = StartAudioEngine();
+        if (err != noErr) {
+            gTransportPlaying = false;
+            UpdatePlayStopButton();
+            SetActivityError("\pPlay error ", err);
+            SysBeep(10);
+        }
+        return;
+    }
+
+    BeginPlayFadeTo(256L);
+}
+
+static void TogglePlayStop(void)
+{
+    if (gTransportPlaying) {
+        gTransportPlaying = false;
+        UpdatePlayStopButton();
+        RequestStopPlay();
+    } else {
+        if (!gSample.loaded) {
+            SysBeep(10);
+            return;
+        }
+        gTransportPlaying = true;
+        UpdatePlayStopButton();
+        RequestStartPlay();
+    }
+}
+
 static void LoopFramesFromNorms(long startNorm, long endNorm, long *outStartFrame, long *outEndFrame)
 {
     long startN = startNorm;
@@ -1355,8 +1676,6 @@ static void ApplyGrainControls(void)
     long sizeFrames;
     long requestedRateFrames;
     long minSafeRateFrames;
-    double pitchRatio;
-    double semis;
 
     gSafetyClampActive = false;
 
@@ -1386,12 +1705,7 @@ static void ApplyGrainControls(void)
     gOutputGain256 = (GainPercentFromNorm(gGainNorm) * 256L) / 100L;
     if (gOutputGain256 < 0L) gOutputGain256 = 0L;
 
-    semis = (double)PitchSemitonesFromNorm(gPitchNorm) + ((double)FineTuneCentsFromNorm(gFineTuneNorm) / 100.0);
-    pitchRatio = pow(2.0, semis / 12.0);
-    if (pitchRatio < 0.25) pitchRatio = 0.25;
-    if (pitchRatio > 4.0) pitchRatio = 4.0;
-    gPitchStep16 = (unsigned long)(pitchRatio * 65536.0 + 0.5);
-    if (gPitchStep16 < 1UL) gPitchStep16 = 1UL;
+    SetPitchTargetFromControls();
 }
 
 static void ResetPitchControls(void)
@@ -1400,6 +1714,10 @@ static void ResetPitchControls(void)
     gFineTuneNorm = 500;
     if (gPitchControl != NULL) SetControlValue(gPitchControl, (short)gPitchNorm);
     if (gFineTuneControl != NULL) SetControlValue(gFineTuneControl, (short)gFineTuneNorm);
+    gPitchGlideFramesLeft = 0L;
+    gPitchTargetStep16 = PitchTargetStep16FromControls();
+    gPitchStep16 = gPitchTargetStep16;
+    ApplyPitchStepToActiveGrains();
     ApplyGrainControls();
     RequestFullRedraw();
 }
@@ -1670,8 +1988,17 @@ static void FillOutputFrames(short *dst, long frameCount)
             }
         }
 
+        if (gPlayFadeFramesLeft > 0L) {
+            AdvancePlayFade(1L);
+        }
+        if (gPitchGlideFramesLeft > 0L) {
+            AdvancePitchGlide(1L);
+        }
+
         mixL = (mixL * gOutputGain256) / 256L;
         mixR = (mixR * gOutputGain256) / 256L;
+        mixL = (mixL * gPlayFadeGain256) / 256L;
+        mixR = (mixR * gPlayFadeGain256) / 256L;
 
         if (mixL > 32767L) mixL = 32767L;
         if (mixL < -32768L) mixL = -32768L;
@@ -1743,12 +2070,13 @@ static OSErr InitAudioEngine(void)
 
     gEngineRunning = true;
     gEnginePlaying = false;
+    gPlayFadeGain256 = 0L;
     return noErr;
 }
 
 static void DisposeAudioEngine(void)
 {
-    StopAudioEngine();
+    StopAudioEngineImmediate();
     DisposeDoubleBuffers();
 
     if (gChannel != NULL) {
@@ -1781,6 +2109,7 @@ static OSErr StartAudioEngine(void)
     ApplyGrainControls();
     ResetGrainVoices();
     gEnginePlaying = true;
+    BeginPlayFadeTo(256L);
 
     PrimeAndStartDoubleBuffer();
     return noErr;
@@ -1788,17 +2117,7 @@ static OSErr StartAudioEngine(void)
 
 static void StopAudioEngine(void)
 {
-    SndCommand cmd;
-
-    gEnginePlaying = false;
-    if (gChannel != NULL) {
-        cmd.cmd = quietCmd;
-        cmd.param1 = 0;
-        cmd.param2 = 0;
-        SndDoImmediate(gChannel, &cmd);
-        cmd.cmd = flushCmd;
-        SndDoImmediate(gChannel, &cmd);
-    }
+    StopAudioEngineImmediate();
 }
 
 static void CreateSliderControls(void)
@@ -1831,6 +2150,14 @@ static void CreateSliderControls(void)
 
     SetRect(&r, kSliderLeft, kPresetFadeSliderTop, kSliderLeft + kSliderWidth, kPresetFadeSliderTop + kSliderHeight);
     gPresetFadeControl = NewControl(gWindow, &r, "\p", true, (short)gPresetFadeNorm, 0, (short)kSliderMax, scrollBarProc, 0L);
+
+    SetRect(&r, kSliderLeft, kPlayFadeSliderTop, kSliderLeft + kSliderWidth, kPlayFadeSliderTop + kSliderHeight);
+    gPlayFadeControl = NewControl(gWindow, &r, "\p", true, (short)gPlayFadeNorm, 0, (short)kSliderMax, scrollBarProc, 0L);
+    ApplyPlayFadeNorm();
+
+    SetRect(&r, kSliderLeft, kPitchGlideSliderTop, kSliderLeft + kSliderWidth, kPitchGlideSliderTop + kSliderHeight);
+    gPitchGlideControl = NewControl(gWindow, &r, "\p", true, (short)gPitchGlideNorm, 0, (short)kSliderMax, scrollBarProc, 0L);
+    ApplyPitchGlideNorm();
 }
 
 static void CreateMainWindow(void)
@@ -1842,15 +2169,13 @@ static void CreateMainWindow(void)
 
     SetRect(&gLoadRect, kLoadLeft, kLoadTop, kLoadLeft + kLoadWidth, kLoadTop + kLoadHeight);
     SetRect(&gPlayRect, kPlayLeft, kPlayTop, kPlayLeft + kPlayWidth, kPlayTop + kPlayHeight);
-    SetRect(&gStopRect, kStopLeft, kStopTop, kStopLeft + kStopWidth, kStopTop + kStopHeight);
     SetRect(&gResetPitchRect, kResetPitchLeft, kResetPitchTop, kResetPitchLeft + kResetPitchWidth, kResetPitchTop + kResetPitchHeight);
     SetRect(&gAssignRect, kAssignLeft, kAssignTop, kAssignLeft + kAssignWidth, kAssignTop + kAssignHeight);
     SetRect(&gQuitRect, kQuitLeft, kQuitTop, kQuitLeft + kQuitWidth, kQuitTop + kQuitHeight);
     SetRect(&gWaveRect, kWaveLeft, kWaveTop, kWaveLeft + kWaveWidth, kWaveTop + kWaveHeight);
 
     gLoadButton = NewControl(gWindow, &gLoadRect, "\pLoad WAV", true, 0, 0, 1, pushButProc, 0L);
-    gPlayButton = NewControl(gWindow, &gPlayRect, "\pPlay", true, 0, 0, 1, pushButProc, 0L);
-    gStopButton = NewControl(gWindow, &gStopRect, "\pStop", true, 0, 0, 1, pushButProc, 0L);
+    gPlayButton = NewControl(gWindow, &gPlayRect, "\p", true, 0, 0, 1, pushButProc, 0L);
     gResetPitchButton = NewControl(gWindow, &gResetPitchRect, "\pReset Pitch", true, 0, 0, 1, pushButProc, 0L);
     gAssignButton = NewControl(gWindow, &gAssignRect, "\pAssign", true, 0, 0, 1, pushButProc, 0L);
     gQuitButton = NewControl(gWindow, &gQuitRect, "\pQuit", true, 0, 0, 1, pushButProc, 0L);
@@ -2460,7 +2785,7 @@ static void DrawPresetHint(void)
     if (count == 0) {
         AppendPString(line, "\pnone");
     }
-    AppendPString(line, "\p)  W=assign  space=play");
+    AppendPString(line, "\p)  W=assign  space=play/stop");
     MoveTo(20, kPresetHintTop);
     DrawString(line);
 
@@ -2522,13 +2847,34 @@ static void DrawSliderLabels(void)
 
     FormatPresetFadeValue(value);
     DrawLabelValue(kPresetFadeSliderTop - 6, "\pPreset Fade", value);
+
+    FormatPlayFadeValue(value);
+    DrawLabelValue(kPlayFadeSliderTop - 6, "\pPlay/Stop Fade", value);
+
+    FormatPitchGlideValue(value);
+    DrawLabelValue(kPitchGlideSliderTop - 6, "\pPitch Glide", value);
+}
+
+static void FormatPlayFadeValue(Str255 out)
+{
+    CopyPString("\p", out);
+    AppendLong(out, gPlayFadeMS);
+    AppendPString(out, "\p ms");
+}
+
+static void FormatPitchGlideValue(Str255 out)
+{
+    CopyPString("\p", out);
+    AppendLong(out, gPitchGlideMS);
+    AppendPString(out, "\p ms");
 }
 
 static Boolean IsSliderControl(ControlHandle control)
 {
     return (control == gStartControl || control == gEndControl || control == gShiftControl ||
             control == gGrainSizeControl || control == gGrainRateControl || control == gGainControl ||
-            control == gPitchControl || control == gFineTuneControl || control == gPresetFadeControl);
+            control == gPitchControl || control == gFineTuneControl || control == gPresetFadeControl ||
+            control == gPlayFadeControl || control == gPitchGlideControl);
 }
 
 static void MaybeNudgeScrollbar(ControlHandle control, ControlPartCode initialPart)
@@ -2601,6 +2947,12 @@ static void SliderActionLive(ControlHandle control)
         ApplyGrainControls();
     } else if (control == gPresetFadeControl) {
         gPresetFadeNorm = value;
+    } else if (control == gPlayFadeControl) {
+        gPlayFadeNorm = value;
+        ApplyPlayFadeNorm();
+    } else if (control == gPitchGlideControl) {
+        gPitchGlideNorm = value;
+        ApplyPitchGlideNorm();
     }
 }
 
@@ -2641,6 +2993,14 @@ static void ApplyControlValue(ControlHandle control, long value)
     } else if (control == gPresetFadeControl) {
         gPresetFadeNorm = value;
         RequestFullRedraw();
+    } else if (control == gPlayFadeControl) {
+        gPlayFadeNorm = value;
+        ApplyPlayFadeNorm();
+        RequestFullRedraw();
+    } else if (control == gPitchGlideControl) {
+        gPitchGlideNorm = value;
+        ApplyPitchGlideNorm();
+        RequestFullRedraw();
     }
 }
 
@@ -2677,8 +3037,7 @@ static void DrawMainWindow(void)
     DrawString(gLoadedName);
 
     Draw1Control(gLoadButton);
-    Draw1Control(gPlayButton);
-    Draw1Control(gStopButton);
+    DrawPlayStopButton();
     Draw1Control(gResetPitchButton);
     Draw1Control(gAssignButton);
     Draw1Control(gQuitButton);
@@ -2699,6 +3058,8 @@ static void DrawMainWindow(void)
     Draw1Control(gPitchControl);
     Draw1Control(gFineTuneControl);
     Draw1Control(gPresetFadeControl);
+    Draw1Control(gPlayFadeControl);
+    Draw1Control(gPitchGlideControl);
 
     DrawPresetHint();
     DrawFadeModeRow();
@@ -2721,14 +3082,7 @@ static void HandleControlHit(ControlHandle control)
         }
         return;
     } else if (control == gPlayButton) {
-        OSErr err = StartAudioEngine();
-        if (err != noErr) {
-            SetActivityError("\pPlay error ", err);
-            SysBeep(10);
-        }
-        return;
-    } else if (control == gStopButton) {
-        StopAudioEngine();
+        TogglePlayStop();
         return;
     } else if (control == gResetPitchButton) {
         ResetPitchControls();
@@ -2775,7 +3129,15 @@ static void HandleMouseDown(EventRecord *event)
             controlPart = FindControl(localPt, whichWindow, &control);
             if (controlPart != 0 && control != NULL) {
                 if (control == gFadeModeButton) {
-                    ToggleFadeModeControl();
+                    short fadeValBefore = GetControlValue(gFadeModeButton);
+                    if (TrackControl(control, localPt, NULL) != 0) {
+                        short fadeValAfter = GetControlValue(gFadeModeButton);
+                        if (fadeValAfter != fadeValBefore) {
+                            gPresetFadeVolumeMode = (fadeValAfter != 0);
+                        } else {
+                            ToggleFadeModeControl();
+                        }
+                    }
                 } else if (IsSliderControl(control)) {
                     short before = GetControlValue(control);
 
@@ -2830,9 +3192,8 @@ static void HandleKeyDown(EventRecord *event)
     } else if (c == 'q' || c == 'Q') {
         gDone = true;
     } else if (c == ' ') {
-        StartAudioEngine();
+        TogglePlayStop();
     }
-    /* Stop is the Stop button only — 's' is a preset key. */
 }
 
 static void HandleUpdate(EventRecord *event)
@@ -2849,23 +3210,12 @@ static void HandleUpdate(EventRecord *event)
 static void EventLoop(void)
 {
     EventRecord event;
+
     while (!gDone) {
+        gInSliderTrack = false;
         ProcessBackgroundTasks();
         if (WaitNextEvent(everyEvent, &event, 6, NULL)) {
-            switch (event.what) {
-                case mouseDown:
-                    HandleMouseDown(&event);
-                    break;
-                case updateEvt:
-                    HandleUpdate(&event);
-                    break;
-                case keyDown:
-                case autoKey:
-                    HandleKeyDown(&event);
-                    break;
-                default:
-                    break;
-            }
+            DispatchEvent(&event);
         }
     }
 }
