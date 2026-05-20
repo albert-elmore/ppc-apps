@@ -39,12 +39,52 @@
 
 #define G3_DECK_COUNT 3
 #define G3_SAMPLE_RATE 44100
+#define G3_FRAMES_PER_BUFFER 1024
+
+/* ---------- freeze / granular (tweak and rebuild) ---------- */
+#define G3_FREEZE_WINDOW_MS           1000
+#define G3_GRAIN_DURATION_MS          200
+#define G3_GRAIN_SPAWN_INTERVAL_MS    10  /* higher = less CPU in audio callback */
+#define G3_GRAIN_FADE_MS              20  /* fade in/out; capped to half grain length */
+#define G3_FREEZE_MAX_GRAINS          25
+#define G3_FREEZE_OUTPUT_GAIN         0.60f /* per-grain level before fixed headroom scale */
+#define G3_FREEZE_MIX_HEADROOM        0.32f /* ~1/sqrt(max grains); avoids pumping pops */
+#define G3_FREEZE_CROSSFADE_MS        40   /* fade between play and freeze on toggle */
+
+typedef enum G3FreezeXfadeDir {
+    G3_FREEZE_XFADE_NONE = 0,
+    G3_FREEZE_XFADE_IN = 1,
+    G3_FREEZE_XFADE_OUT = 2
+} G3FreezeXfadeDir;
 
 typedef enum G3TransportState {
     G3_TRANSPORT_STOPPED = 0,
     G3_TRANSPORT_PLAYING = 1,
-    G3_TRANSPORT_PAUSED = 2
+    G3_TRANSPORT_PAUSED = 2,
+    G3_TRANSPORT_FROZEN = 3
 } G3TransportState;
+
+typedef struct G3Grain {
+    int active;
+    unsigned long start_frame_l;
+    unsigned long start_frame_r;
+    unsigned long age;
+    unsigned long length;
+} G3Grain;
+
+typedef struct G3FreezeCapture {
+    short* buffer;
+    unsigned long frame_count;
+    int channels;
+    unsigned long grain_length_samples;
+    unsigned long fade_length_samples;
+    unsigned long spawn_interval_samples;
+    double spawn_accum;
+    int xfade_dir;
+    unsigned long xfade_remain;
+    unsigned long xfade_total;
+    G3Grain grains[G3_FREEZE_MAX_GRAINS];
+} G3FreezeCapture;
 
 typedef struct G3DeckStatus {
     int loaded;
@@ -83,6 +123,7 @@ typedef struct G3Deck {
     float pan_now;
     float ramp_seconds;
     float peak_linear;
+    G3FreezeCapture freeze;
 } G3Deck;
 
 typedef struct G3Player {
@@ -99,6 +140,7 @@ void g3_player_unload(G3Player* player, int deck_index);
 void g3_player_play(G3Player* player, int deck_index);
 void g3_player_pause(G3Player* player, int deck_index);
 void g3_player_stop(G3Player* player, int deck_index);
+int g3_player_toggle_freeze(G3Player* player, int deck_index);
 void g3_player_seek_ms(G3Player* player, int deck_index, unsigned long position_ms);
 void g3_player_set_volume(G3Player* player, int deck_index, float value);
 void g3_player_set_pan(G3Player* player, int deck_index, float value);
@@ -129,7 +171,82 @@ static float g3_db_to_linear(float db) {
     return (float)pow(10.0, (double)db / 20.0);
 }
 
-static void g3_deck_reset(G3Deck* deck) {
+static unsigned long g3_ms_to_frames(unsigned long ms) {
+    return (unsigned long)((ms * (unsigned long)G3_SAMPLE_RATE) / 1000UL);
+}
+
+static unsigned long gFreezeRng = 1;
+static short* gFreezePendingFree[G3_DECK_COUNT];
+
+static unsigned long g3_freeze_rand(void) {
+    gFreezeRng = (gFreezeRng * 1103515245UL) + 12345UL;
+    return (gFreezeRng >> 16) & 32767UL;
+}
+
+static void g3_freeze_drain_pending(void) {
+    int d;
+    for (d = 0; d < G3_DECK_COUNT; ++d) {
+        if (gFreezePendingFree[d] != NULL) {
+            free(gFreezePendingFree[d]);
+            gFreezePendingFree[d] = NULL;
+        }
+    }
+}
+
+/* Detach capture buffer; actual free happens at next audio buffer boundary. */
+static void g3_freeze_release_deck(int deck_index, G3FreezeCapture* fz) {
+    int g;
+    if (fz == NULL) return;
+    if (fz->buffer != NULL) {
+        if (deck_index >= 0 && deck_index < G3_DECK_COUNT) {
+            if (gFreezePendingFree[deck_index] != NULL) free(gFreezePendingFree[deck_index]);
+            gFreezePendingFree[deck_index] = fz->buffer;
+        } else {
+            free(fz->buffer);
+        }
+        fz->buffer = NULL;
+    }
+    for (g = 0; g < G3_FREEZE_MAX_GRAINS; ++g) fz->grains[g].active = 0;
+    fz->spawn_accum = 0.0;
+    fz->frame_count = 0;
+    fz->channels = 0;
+    fz->grain_length_samples = 0;
+    fz->fade_length_samples = 0;
+    fz->spawn_interval_samples = 0;
+    fz->xfade_dir = G3_FREEZE_XFADE_NONE;
+    fz->xfade_remain = 0;
+    fz->xfade_total = 0;
+}
+
+static void g3_freeze_start_xfade(G3FreezeCapture* fz, int dir) {
+    unsigned long samples;
+    if (fz == NULL) return;
+    samples = g3_ms_to_frames((unsigned long)G3_FREEZE_CROSSFADE_MS);
+    if (samples < 1) samples = 1;
+    fz->xfade_dir = dir;
+    fz->xfade_total = samples;
+    fz->xfade_remain = samples;
+}
+
+static void g3_freeze_begin_unfreeze(G3Deck* deck) {
+    G3FreezeCapture* fz;
+    if (deck == NULL) return;
+    fz = &deck->freeze;
+    fz->spawn_accum = 0.0;
+    g3_freeze_start_xfade(fz, G3_FREEZE_XFADE_OUT);
+}
+
+static void g3_freeze_end_capture(G3Deck* deck, int deck_index) {
+    if (deck == NULL) return;
+    deck->state = G3_TRANSPORT_PAUSED;
+    g3_freeze_release_deck(deck_index, &deck->freeze);
+}
+
+static int g3_spawn_grain(G3FreezeCapture* fz);
+
+static void g3_deck_reset(G3Deck* deck, int deck_index) {
+    if (deck == NULL) return;
+    g3_freeze_release_deck(deck_index, &deck->freeze);
     memset(deck, 0, sizeof(*deck));
     deck->volume = 0.8f;
     deck->pan = 0.0f;
@@ -144,12 +261,14 @@ void g3_player_init(G3Player* player) {
     int i;
     memset(player, 0, sizeof(*player));
     player->master_volume = g3_db_to_linear(-4.0f);
-    for (i = 0; i < G3_DECK_COUNT; ++i) g3_deck_reset(&player->decks[i]);
+    for (i = 0; i < G3_DECK_COUNT; ++i) g3_deck_reset(&player->decks[i], i);
 }
 
 void g3_player_shutdown(G3Player* player) {
     int i;
+    g3_freeze_drain_pending();
     for (i = 0; i < G3_DECK_COUNT; ++i) {
+        g3_freeze_release_deck(i, &player->decks[i].freeze);
         free(player->decks[i].wav.samples);
         player->decks[i].wav.samples = NULL;
     }
@@ -364,7 +483,7 @@ void g3_player_unload(G3Player* player, int deck_index) {
     if (!g3_clamp_deck_index(deck_index)) return;
     deck = &player->decks[deck_index];
     free(deck->wav.samples);
-    g3_deck_reset(deck);
+    g3_deck_reset(deck, deck_index);
 }
 
 void g3_player_play(G3Player* player, int deck_index) {
@@ -372,8 +491,18 @@ void g3_player_play(G3Player* player, int deck_index) {
     if (!g3_clamp_deck_index(deck_index)) return;
     deck = &player->decks[deck_index];
     if (!deck->loaded) return;
+    if (deck->state == G3_TRANSPORT_FROZEN) {
+        deck->speed_target = 1.0 + ((double)deck->pitch_percent / 100.0);
+        if (deck->speed_target < 0.000001) deck->speed_target = 0.000001;
+        if (deck->ramp_seconds <= 0.0001f) deck->speed_current = deck->speed_target;
+        g3_freeze_begin_unfreeze(deck);
+        deck->state = G3_TRANSPORT_PLAYING;
+        return;
+    }
     deck->state = G3_TRANSPORT_PLAYING;
     deck->speed_target = 1.0 + ((double)deck->pitch_percent / 100.0);
+    if (deck->speed_target < 0.000001) deck->speed_target = 0.000001;
+    if (deck->ramp_seconds <= 0.0001f) deck->speed_current = deck->speed_target;
 }
 
 void g3_player_pause(G3Player* player, int deck_index) {
@@ -381,6 +510,7 @@ void g3_player_pause(G3Player* player, int deck_index) {
     if (!g3_clamp_deck_index(deck_index)) return;
     deck = &player->decks[deck_index];
     if (!deck->loaded) return;
+    if (deck->state == G3_TRANSPORT_FROZEN) return;
     deck->speed_target = 0.0;
     deck->state = G3_TRANSPORT_PAUSED;
 }
@@ -390,8 +520,95 @@ void g3_player_stop(G3Player* player, int deck_index) {
     if (!g3_clamp_deck_index(deck_index)) return;
     deck = &player->decks[deck_index];
     if (!deck->loaded) return;
+    if (deck->state == G3_TRANSPORT_FROZEN) g3_freeze_end_capture(deck, deck_index);
     deck->speed_target = 0.0;
     deck->state = G3_TRANSPORT_STOPPED;
+}
+
+static int g3_freeze_begin(G3Deck* deck, int deck_index) {
+    int g;
+    unsigned long window_frames;
+    unsigned long half_frames;
+    unsigned long start_frame;
+    unsigned long copy_samples;
+    unsigned long bytes;
+    short* dst;
+    const short* src;
+    G3FreezeCapture* fz;
+
+    if (deck == NULL || !deck->loaded || deck->wav.samples == NULL || deck->wav.frame_count == 0) return 0;
+
+    g3_freeze_release_deck(deck_index, &deck->freeze);
+    fz = &deck->freeze;
+
+    window_frames = g3_ms_to_frames((unsigned long)G3_FREEZE_WINDOW_MS);
+    if (window_frames < 2) window_frames = 2;
+    if (window_frames > deck->wav.frame_count) window_frames = deck->wav.frame_count;
+
+    half_frames = window_frames / 2;
+    start_frame = (unsigned long)deck->frame_pos;
+    if (start_frame > half_frames) start_frame -= half_frames;
+    else start_frame = 0;
+    if (start_frame + window_frames > deck->wav.frame_count)
+        start_frame = deck->wav.frame_count - window_frames;
+
+    copy_samples = window_frames * (unsigned long)deck->wav.channels;
+    bytes = copy_samples * sizeof(short);
+    dst = (short*)malloc((size_t)bytes);
+    if (dst == NULL) return 0;
+
+    src = deck->wav.samples + (start_frame * (unsigned long)deck->wav.channels);
+    memcpy(dst, src, (size_t)bytes);
+
+    fz->buffer = dst;
+    fz->frame_count = window_frames;
+    fz->channels = deck->wav.channels;
+    fz->spawn_interval_samples = g3_ms_to_frames((unsigned long)G3_GRAIN_SPAWN_INTERVAL_MS);
+    if (fz->spawn_interval_samples < 1) fz->spawn_interval_samples = 1;
+    fz->grain_length_samples = g3_ms_to_frames((unsigned long)G3_GRAIN_DURATION_MS);
+    if (fz->grain_length_samples < 2) fz->grain_length_samples = 2;
+    if (fz->grain_length_samples > fz->frame_count) fz->grain_length_samples = fz->frame_count;
+    fz->fade_length_samples = g3_ms_to_frames((unsigned long)G3_GRAIN_FADE_MS);
+    if (fz->fade_length_samples < 1) fz->fade_length_samples = 1;
+    if (fz->fade_length_samples > fz->grain_length_samples / 2)
+        fz->fade_length_samples = fz->grain_length_samples / 2;
+    fz->spawn_accum = 0.0;
+    for (g = 0; g < G3_FREEZE_MAX_GRAINS; ++g) {
+        fz->grains[g].active = 0;
+        fz->grains[g].age = 0;
+        fz->grains[g].length = 0;
+    }
+    gFreezeRng = (unsigned long)TickCount() | 1UL;
+    for (g = 0; g < 3; ++g) {
+        if (g3_spawn_grain(fz)) {
+            unsigned long stagger = (fz->grain_length_samples * (unsigned long)g) / 3UL;
+            if (stagger >= fz->grains[g].length) stagger = fz->grains[g].length - 1;
+            fz->grains[g].age = stagger;
+        }
+    }
+    g3_freeze_start_xfade(fz, G3_FREEZE_XFADE_IN);
+
+    deck->speed_target = 0.0;
+    deck->speed_current = 0.0;
+    deck->state = G3_TRANSPORT_FROZEN;
+    return 1;
+}
+
+int g3_player_toggle_freeze(G3Player* player, int deck_index) {
+    G3Deck* deck;
+    if (!g3_clamp_deck_index(deck_index)) return 0;
+    deck = &player->decks[deck_index];
+    if (!deck->loaded) return 0;
+    if (deck->state == G3_TRANSPORT_FROZEN) {
+        deck->speed_target = 1.0 + ((double)deck->pitch_percent / 100.0);
+        if (deck->speed_target < 0.000001) deck->speed_target = 0.000001;
+        if (deck->ramp_seconds <= 0.0001f) deck->speed_current = deck->speed_target;
+        g3_freeze_begin_unfreeze(deck);
+        deck->state = G3_TRANSPORT_PLAYING;
+        return 0;
+    }
+    if (!g3_freeze_begin(deck, deck_index)) return -1;
+    return 1;
 }
 
 void g3_player_seek_ms(G3Player* player, int deck_index, unsigned long position_ms) {
@@ -400,6 +617,7 @@ void g3_player_seek_ms(G3Player* player, int deck_index, unsigned long position_
     if (!g3_clamp_deck_index(deck_index)) return;
     deck = &player->decks[deck_index];
     if (!deck->loaded) return;
+    if (deck->state == G3_TRANSPORT_FROZEN) g3_freeze_end_capture(deck, deck_index);
     frame_pos = ((double)position_ms / 1000.0) * (double)G3_SAMPLE_RATE;
     if (frame_pos < 0.0) frame_pos = 0.0;
     if (frame_pos >= (double)deck->wav.frame_count) frame_pos = (double)(deck->wav.frame_count ? deck->wav.frame_count - 1 : 0);
@@ -492,6 +710,213 @@ static void g3_update_speed(G3Deck* deck, int frame_count) {
 }
 
 /* Same ramp law as speed: ~1 unit per ramp_seconds toward target (matches pitch motor). */
+static void g3_ramp_float_toward(float* cur, float target, double ramp_sec, int frames);
+
+static float g3_grain_envelope(unsigned long age, unsigned long length, unsigned long fade_len) {
+    double t;
+    if (length == 0) return 0.0f;
+    if (fade_len == 0) return 1.0f;
+    if (age < fade_len) {
+        t = (double)age / (double)fade_len;
+        return (float)(0.5 * (1.0 - cos(M_PI * t)));
+    }
+    if (age >= length - fade_len) {
+        t = (double)(length - age) / (double)fade_len;
+        return (float)(0.5 * (1.0 - cos(M_PI * t)));
+    }
+    return 1.0f;
+}
+
+/* Linear fade for freeze grains (no trig in audio callback). */
+static float g3_grain_envelope_linear(unsigned long age, unsigned long length, unsigned long fade_len) {
+    if (length == 0) return 0.0f;
+    if (fade_len == 0) return 1.0f;
+    if (age < fade_len) return (float)age / (float)fade_len;
+    if (age >= length - fade_len) return (float)(length - age) / (float)fade_len;
+    return 1.0f;
+}
+
+static double g3_soft_limit(double x) {
+    if (x > 1.0) return 1.0;
+    if (x < -1.0) return -1.0;
+    return x;
+}
+
+static float g3_freeze_xfade_ease(float t) {
+    if (t <= 0.0f) return 0.0f;
+    if (t >= 1.0f) return 1.0f;
+    return (float)(0.5 * (1.0 - cos(M_PI * (double)t)));
+}
+
+static float g3_freeze_xfade_gain_at(const G3FreezeCapture* fz, unsigned long offset) {
+    unsigned long remain;
+    unsigned long total;
+    float t;
+    if (fz == NULL || fz->xfade_dir == G3_FREEZE_XFADE_NONE || fz->xfade_total == 0) return 1.0f;
+    remain = fz->xfade_remain;
+    if (offset >= remain) {
+        if (fz->xfade_dir == G3_FREEZE_XFADE_OUT) return 0.0f;
+        return 1.0f;
+    }
+    remain -= offset;
+    total = fz->xfade_total;
+    if (fz->xfade_dir == G3_FREEZE_XFADE_IN) {
+        t = 1.0f - (float)remain / (float)total;
+        return g3_freeze_xfade_ease(t);
+    }
+    t = (float)remain / (float)total;
+    return g3_freeze_xfade_ease(t);
+}
+
+static unsigned long g3_freeze_grain_length_samples(const G3FreezeCapture* fz) {
+    unsigned long len;
+    if (fz == NULL) return g3_ms_to_frames((unsigned long)G3_GRAIN_DURATION_MS);
+    len = fz->grain_length_samples;
+    if (len < 2) len = 2;
+    if (fz->frame_count > 0 && len > fz->frame_count) len = fz->frame_count;
+    return len;
+}
+
+static int g3_spawn_grain(G3FreezeCapture* fz) {
+    int g;
+    unsigned long pick_l;
+    unsigned long pick_r;
+    unsigned long max_start;
+    unsigned long grain_len;
+    if (fz == NULL || fz->buffer == NULL || fz->frame_count < 2) return 0;
+    grain_len = g3_freeze_grain_length_samples(fz);
+    if (grain_len < 2) return 0;
+    for (g = 0; g < G3_FREEZE_MAX_GRAINS; ++g) {
+        if (!fz->grains[g].active) break;
+    }
+    if (g >= G3_FREEZE_MAX_GRAINS) return 0;
+    if (fz->frame_count > grain_len)
+        max_start = fz->frame_count - grain_len;
+    else
+        max_start = 0;
+    pick_l = g3_freeze_rand();
+    pick_r = g3_freeze_rand();
+    if (max_start > 0) {
+        pick_l %= (max_start + 1);
+        pick_r %= (max_start + 1);
+    } else {
+        pick_l = 0;
+        pick_r = 0;
+    }
+    fz->grains[g].active = 1;
+    fz->grains[g].start_frame_l = pick_l;
+    fz->grains[g].start_frame_r = pick_r;
+    fz->grains[g].age = 0;
+    fz->grains[g].length = grain_len;
+    return 1;
+}
+
+static void g3_grain_mix_sample(G3FreezeCapture* fz, G3Grain* gr, double* out_l, double* out_r) {
+    unsigned long frame_l;
+    unsigned long frame_r;
+    float env;
+    double sample_l;
+    double sample_r;
+
+    if (fz == NULL || gr == NULL || !gr->active || fz->buffer == NULL) return;
+    if (gr->age >= gr->length) {
+        gr->active = 0;
+        return;
+    }
+    frame_l = gr->start_frame_l + gr->age;
+    frame_r = gr->start_frame_r + gr->age;
+    if (frame_l >= fz->frame_count) frame_l = fz->frame_count - 1;
+    if (frame_r >= fz->frame_count) frame_r = fz->frame_count - 1;
+
+    env = g3_grain_envelope_linear(gr->age, gr->length, fz->fade_length_samples);
+    if (fz->channels == 1) {
+        sample_l = (double)fz->buffer[frame_l] / 32768.0;
+        sample_r = (double)fz->buffer[frame_r] / 32768.0;
+    } else {
+        sample_l = (double)fz->buffer[(frame_l * 2) + 0] / 32768.0;
+        sample_r = (double)fz->buffer[(frame_r * 2) + 1] / 32768.0;
+    }
+    *out_l += sample_l * (double)env;
+    *out_r += sample_r * (double)env;
+    gr->age++;
+    if (gr->age >= gr->length) gr->active = 0;
+}
+
+static double sFreezeMixL[G3_FRAMES_PER_BUFFER];
+static double sFreezeMixR[G3_FRAMES_PER_BUFFER];
+
+static void g3_render_frozen_buffer(int deck_index, G3Deck* deck, double* out_l, double* out_r, int frame_count,
+                                  float* peak_out) {
+    G3FreezeCapture* fz;
+    int si;
+    int g;
+    double interval;
+    double vol_scale;
+    float peak;
+    int render_frozen;
+
+    if (deck == NULL || out_l == NULL || out_r == NULL || frame_count <= 0) return;
+    fz = &deck->freeze;
+    if (fz->buffer == NULL) return;
+    render_frozen = (deck->state == G3_TRANSPORT_FROZEN);
+    if (!render_frozen && !(deck->state == G3_TRANSPORT_PLAYING && fz->xfade_dir == G3_FREEZE_XFADE_OUT &&
+                            fz->xfade_remain > 0))
+        return;
+    if (frame_count > G3_FRAMES_PER_BUFFER) frame_count = G3_FRAMES_PER_BUFFER;
+
+    g3_ramp_float_toward(&deck->volume_now, deck->volume, (double)deck->ramp_seconds, frame_count);
+    vol_scale = (double)deck->volume_now * (double)G3_FREEZE_OUTPUT_GAIN * (double)G3_FREEZE_MIX_HEADROOM;
+    interval = (double)fz->spawn_interval_samples;
+    if (interval < 1.0) interval = 1.0;
+    peak = 0.0f;
+
+    for (si = 0; si < frame_count; ++si) {
+        double grain_l;
+        double grain_r;
+        double sample_l;
+        double sample_r;
+        float abs_local;
+
+        if (fz->xfade_dir != G3_FREEZE_XFADE_OUT) {
+            fz->spawn_accum += 1.0;
+            if (fz->spawn_accum >= interval) {
+                fz->spawn_accum -= interval;
+                g3_spawn_grain(fz);
+            }
+        }
+
+        grain_l = 0.0;
+        grain_r = 0.0;
+        for (g = 0; g < G3_FREEZE_MAX_GRAINS; ++g) {
+            if (fz->grains[g].active) g3_grain_mix_sample(fz, &fz->grains[g], &grain_l, &grain_r);
+        }
+
+        {
+            float xfade = g3_freeze_xfade_gain_at(fz, (unsigned long)si);
+            vol_scale = (double)deck->volume_now * (double)G3_FREEZE_OUTPUT_GAIN * (double)G3_FREEZE_MIX_HEADROOM *
+                        (double)xfade;
+            sample_l = g3_soft_limit(grain_l * vol_scale);
+            sample_r = g3_soft_limit(grain_r * vol_scale);
+        }
+        out_l[si] += sample_l;
+        out_r[si] += sample_r;
+
+        abs_local = (float)(fabs(sample_l) > fabs(sample_r) ? fabs(sample_l) : fabs(sample_r));
+        if (abs_local > peak) peak = abs_local;
+    }
+
+    if (fz->xfade_dir != G3_FREEZE_XFADE_NONE && fz->xfade_remain > 0) {
+        if ((unsigned long)frame_count >= fz->xfade_remain)
+            fz->xfade_remain = 0;
+        else
+            fz->xfade_remain -= (unsigned long)frame_count;
+    }
+    if (fz->xfade_dir == G3_FREEZE_XFADE_OUT && fz->xfade_remain == 0)
+        g3_freeze_release_deck(deck_index, fz);
+
+    if (peak_out != NULL && peak > *peak_out) *peak_out = peak;
+}
+
 static void g3_ramp_float_toward(float* cur, float target, double ramp_sec, int frames) {
     double step;
     double c;
@@ -520,12 +945,27 @@ int g3_player_render(G3Player* player, short* out_stereo, int frame_count) {
     float deck_peak[G3_DECK_COUNT];
 
     if (!out_stereo || frame_count <= 0) return 0;
+    if (frame_count > G3_FRAMES_PER_BUFFER) frame_count = G3_FRAMES_PER_BUFFER;
+    g3_freeze_drain_pending();
     for (d = 0; d < G3_DECK_COUNT; ++d) deck_peak[d] = 0.0f;
     player->master_peak_linear = 0.0f;
 
+    memset(sFreezeMixL, 0, (size_t)frame_count * sizeof(double));
+    memset(sFreezeMixR, 0, (size_t)frame_count * sizeof(double));
+    for (d = 0; d < G3_DECK_COUNT; ++d) {
+        G3Deck* deck = &player->decks[d];
+        if (!deck->loaded) continue;
+        if (deck->freeze.buffer != NULL) {
+            if (deck->state == G3_TRANSPORT_FROZEN ||
+                (deck->state == G3_TRANSPORT_PLAYING && deck->freeze.xfade_dir == G3_FREEZE_XFADE_OUT &&
+                 deck->freeze.xfade_remain > 0))
+                g3_render_frozen_buffer(d, deck, sFreezeMixL, sFreezeMixR, frame_count, &deck_peak[d]);
+        }
+    }
+
     for (i = 0; i < frame_count; ++i) {
-        double mix_l = 0.0;
-        double mix_r = 0.0;
+        double mix_l = sFreezeMixL[i];
+        double mix_r = sFreezeMixR[i];
 
         for (d = 0; d < G3_DECK_COUNT; ++d) {
             G3Deck* deck = &player->decks[d];
@@ -538,6 +978,46 @@ int g3_player_render(G3Player* player, short* out_stereo, int frame_count) {
             float abs_local;
 
             if (!deck->loaded) continue;
+            if (deck->state == G3_TRANSPORT_FROZEN) {
+                G3FreezeCapture* fz_in = &deck->freeze;
+                if (fz_in->buffer != NULL && fz_in->xfade_dir == G3_FREEZE_XFADE_IN && fz_in->xfade_remain > 0 &&
+                    deck->wav.samples != NULL && deck->wav.frame_count > 1) {
+                    float xfade = g3_freeze_xfade_gain_at(fz_in, (unsigned long)i);
+                    double play_l;
+                    double play_r;
+
+                    frame_i = (long)deck->frame_pos;
+                    frame_n = frame_i + 1;
+                    if (frame_n >= (long)deck->wav.frame_count) frame_n = frame_i;
+                    frac = deck->frame_pos - (double)frame_i;
+                    if (deck->wav.channels == 1) {
+                        short s0 = deck->wav.samples[frame_i];
+                        short s1 = deck->wav.samples[frame_n];
+                        play_l = ((double)s0 + ((double)(s1 - s0) * frac)) / 32768.0;
+                        play_r = play_l;
+                    } else {
+                        short l0 = deck->wav.samples[(frame_i * 2) + 0];
+                        short r0 = deck->wav.samples[(frame_i * 2) + 1];
+                        short l1 = deck->wav.samples[(frame_n * 2) + 0];
+                        short r1 = deck->wav.samples[(frame_n * 2) + 1];
+                        play_l = ((double)l0 + ((double)(l1 - l0) * frac)) / 32768.0;
+                        play_r = ((double)r0 + ((double)(r1 - r0) * frac)) / 32768.0;
+                    }
+                    {
+                        double p = (double)((deck->pan_now + 1.0f) * 0.5f);
+                        left_gain = cos((M_PI * 0.5) * p);
+                        right_gain = sin((M_PI * 0.5) * p);
+                    }
+                    g3_ramp_float_toward(&deck->volume_now, deck->volume, (double)deck->ramp_seconds, 1);
+                    play_l *= left_gain * (double)deck->volume_now * (1.0 - (double)xfade);
+                    play_r *= right_gain * (double)deck->volume_now * (1.0 - (double)xfade);
+                    mix_l += play_l;
+                    mix_r += play_r;
+                    abs_local = (float)(fabs(play_l) > fabs(play_r) ? fabs(play_l) : fabs(play_r));
+                    if (abs_local > deck_peak[d]) deck_peak[d] = abs_local;
+                }
+                continue;
+            }
             g3_update_speed(deck, 1);
             g3_ramp_float_toward(&deck->volume_now, deck->volume, (double)deck->ramp_seconds, 1);
             g3_ramp_float_toward(&deck->pan_now, deck->pan, (double)deck->ramp_seconds, 1);
@@ -581,6 +1061,12 @@ int g3_player_render(G3Player* player, short* out_stereo, int frame_count) {
 
             sample_l = mono_or_l * left_gain * (double)deck->volume_now;
             sample_r = right * right_gain * (double)deck->volume_now;
+            if (deck->freeze.buffer != NULL && deck->freeze.xfade_dir == G3_FREEZE_XFADE_OUT &&
+                deck->freeze.xfade_remain > 0) {
+                float xfade = g3_freeze_xfade_gain_at(&deck->freeze, (unsigned long)i);
+                sample_l *= (1.0 - (double)xfade);
+                sample_r *= (1.0 - (double)xfade);
+            }
             mix_l += sample_l;
             mix_r += sample_r;
 
@@ -613,7 +1099,7 @@ int g3_player_render(G3Player* player, short* out_stereo, int frame_count) {
 
 /* ---------- Mac UI / audio I/O ---------- */
 
-#define FRAMES_PER_BUFFER 1024
+#define FRAMES_PER_BUFFER G3_FRAMES_PER_BUFFER
 #define WINDOW_W 800
 #define WINDOW_H 656
 #define WAVE_RIGHT (WINDOW_W - 20)
@@ -654,14 +1140,19 @@ int g3_player_render(G3Player* player, short* out_stereo, int frame_count) {
 #define MASTER_SL_T (short)(MASTER_BAND_TOP + 8)
 #define MASTER_SL_B (short)(MASTER_BAND_TOP + 24)
 #define MASTER_LBL_BASELINE (short)(MASTER_SL_T + SL_TRACK_TEXT_BASE)
-#define MASTER_STAT_T (short)(MASTER_BAND_TOP + 34)
-#define MASTER_STAT_B (short)(MASTER_BAND_TOP + 60)
-#define MSG_RECT_T (short)(MASTER_BAND_TOP + 72)
-#define MSG_RECT_B (short)(MASTER_BAND_TOP + 108)
-#define MSG_LABEL_Y (short)(MASTER_BAND_TOP + 76)
+#define MASTER_STAT_H 22
+#define MASTER_STAT_T (short)(MASTER_BAND_TOP + 28)
+#define MASTER_STAT_B (short)(MASTER_STAT_T + MASTER_STAT_H)
+#define MSG_ROW_T (short)(MASTER_STAT_B + 8)
+#define MSG_ROW_H 22
+#define MSG_ROW_B (short)(MSG_ROW_T + MSG_ROW_H)
+#define MSG_BASELINE (short)(MSG_ROW_T + SL_TRACK_TEXT_BASE)
+#define MSG_RECT_T MSG_ROW_T
+#define MSG_RECT_B MSG_ROW_B
 #define MSG_TEXT_LEFT 86
-#define BTN_CORNER_TOP (short)(MSG_RECT_T + 6)
-#define BTN_CORNER_BOT (short)(MSG_RECT_T + 26)
+#define BTN_CORNER_TOP (short)(MSG_ROW_T + 2)
+#define BTN_CORNER_BOT (short)(MSG_ROW_B - 2)
+#define STAT_TEXT_BASELINE_OFF 20
 #define BTN_CORNER_QUIT_R (short)(WAVE_RIGHT - 8)
 #define BTN_CORNER_QUIT_L (short)(WAVE_RIGHT - 78)
 #define BTN_CORNER_DEF_R (short)(BTN_CORNER_QUIT_L - 10)
@@ -690,6 +1181,7 @@ static int gUiDeck = 0;
 static ControlHandle gTabBtn[G3_DECK_COUNT];
 static ControlHandle gLoadBtn = NULL;
 static ControlHandle gPlayBtn = NULL;
+static ControlHandle gFreezeBtn = NULL;
 static ControlHandle gStopBtn = NULL;
 static ControlHandle gVolSlider = NULL;
 static ControlHandle gPanSlider = NULL;
@@ -736,6 +1228,7 @@ static void DrawSliderValues(void);
 static void DrawWaveformBody(void);
 static void UpdateWaveformPlayhead(void);
 static void MarkWaveformDirty(void);
+static void RedrawVisibleWaveform(void);
 static void UpdateStatusAreas(void);
 static void DoUpdate(EventRecord* event);
 static void UiPumpEvents(void);
@@ -747,6 +1240,7 @@ static void SwitchToDeck(int deckIndex);
 static short SliderMaxForControl(ControlHandle c);
 static void MaybeNudgeScrollbar(ControlHandle c, ControlPartCode initialPart);
 static void RefreshPlayPauseButton(void);
+static void RefreshFreezeButton(void);
 static short MasterDbToSlider(float db);
 static float SliderToMasterDb(short s);
 static float DeckVolLinearToDb(float linear);
@@ -765,6 +1259,15 @@ static void DrawCString(const char* src) {
     Str255 p;
     MakePString(src, p);
     DrawString(p);
+}
+
+/* QuickDraw MoveTo Y is the text baseline; center in short status bands. */
+static short TextBaselineInRect(const Rect* r) {
+    short h;
+    if (r == NULL) return 0;
+    h = (short)(r->bottom - r->top);
+    if (h <= 18) return (short)(r->top + SL_TRACK_TEXT_BASE);
+    return (short)(r->top + STAT_TEXT_BASELINE_OFF);
 }
 
 static void CopyPascalToCString(const unsigned char* pstr, char* dst, size_t dstSize) {
@@ -797,11 +1300,12 @@ static void UiPumpEvents(void) {
     UpdateStatusAreas();
 }
 
-static void FreeDeckSamplesSafe(G3Deck* deck) {
+static void FreeDeckSamplesSafe(int deck_index, G3Deck* deck) {
     short* old;
     if (deck == NULL) return;
     old = deck->wav.samples;
     if (old == NULL) return;
+    g3_freeze_release_deck(deck_index, &deck->freeze);
     deck->loaded = 0;
     deck->wav.samples = NULL;
     deck->wav.frame_count = 0;
@@ -946,10 +1450,18 @@ static void MarkWaveformDirty(void) {
     gWavePlayheadX = -1;
 }
 
+static void RedrawVisibleWaveform(void) {
+    MarkWaveformDirty();
+    DrawWaveformBody();
+}
+
 static int AnyDeckPlaying(void) {
     int i;
     for (i = 0; i < G3_DECK_COUNT; ++i) {
-        if (gPlayer.decks[i].state == G3_TRANSPORT_PLAYING) return 1;
+        if (gPlayer.decks[i].state == G3_TRANSPORT_PLAYING ||
+            gPlayer.decks[i].state == G3_TRANSPORT_FROZEN) {
+            return 1;
+        }
     }
     return 0;
 }
@@ -1127,6 +1639,22 @@ static void RefreshPlayPauseButton(void) {
     else
         SetControlTitle(gPlayBtn, "\pPlay");
     Draw1Control(gPlayBtn);
+}
+
+static void RefreshFreezeButton(void) {
+    static int s_frDeck = -1;
+    static G3TransportState s_frState = (G3TransportState)(-999);
+    G3TransportState st;
+    if (gFreezeBtn == NULL || gWindow == NULL) return;
+    st = gPlayer.decks[gUiDeck].state;
+    if (gUiDeck == s_frDeck && st == s_frState) return;
+    s_frDeck = gUiDeck;
+    s_frState = st;
+    if (st == G3_TRANSPORT_FROZEN)
+        SetControlTitle(gFreezeBtn, "\pUnfreeze");
+    else
+        SetControlTitle(gFreezeBtn, "\pFreeze");
+    Draw1Control(gFreezeBtn);
 }
 
 static void RebuildWaveformBucket(int deck_index, int point_index) {
@@ -1389,7 +1917,7 @@ static int LoadDeckFromFSSpec(int deck_index, const FSSpec* spec) {
     UiPumpEvents();
     g3_pcm16_le_to_host_yield(pcm, pcmBytes);
 
-    FreeDeckSamplesSafe(deck);
+    FreeDeckSamplesSafe(deck_index, deck);
     deck->wav.samples = pcm;
     deck->wav.channels = (int)fmtChannels;
     deck->wav.frame_count = pcmBytes / (unsigned long)(fmtChannels * 2);
@@ -1463,15 +1991,19 @@ static void DrawSliderValues(void) {
 }
 
 static void UpdateStatusAreas(void) {
-    int i;
     char line[384];
-    char mini[384];
     G3DeckStatus d;
     char pos[16];
     char dur[16];
     const char* fileLabel;
+    short deckY;
+    short masterY;
+    short msgY;
     static int s_peakDeck = -1;
     SetPort(gWindow);
+    deckY = TextBaselineInRect(&gDeckStatusRect);
+    masterY = TextBaselineInRect(&gMasterStatusRect);
+    msgY = MSG_BASELINE;
 
     if (s_peakDeck != gUiDeck) {
         s_peakDeck = gUiDeck;
@@ -1491,44 +2023,26 @@ static void UpdateStatusAreas(void) {
     snprintf(line, sizeof(line),
              "Deck %d  %s  %s  %s / %s  Peak %.0f dBFS",
              gUiDeck + 1,
-             d.state == G3_TRANSPORT_PLAYING ? "PLAY" : (d.state == G3_TRANSPORT_PAUSED ? "PAUSE" : "STOP"),
+             d.state == G3_TRANSPORT_PLAYING ? "PLAY" :
+             (d.state == G3_TRANSPORT_FROZEN ? "FREEZE" :
+              (d.state == G3_TRANSPORT_PAUSED ? "PAUSE" : "STOP")),
              fileLabel, pos, dur, (double)gShownDeckPeakDb);
     if (strcmp(line, gPrevDeckStat) != 0) {
         EraseRect(&gDeckStatusRect);
-        MoveTo(gDeckStatusRect.left + 6, gDeckStatusRect.bottom - 6);
+        MoveTo(gDeckStatusRect.left + 6, deckY);
         DrawCString(line);
         strncpy(gPrevDeckStat, line, sizeof(gPrevDeckStat) - 1);
         gPrevDeckStat[sizeof(gPrevDeckStat) - 1] = '\0';
     }
 
     {
-        size_t lm = 0;
-        mini[0] = '\0';
-        for (i = 0; i < G3_DECK_COUNT; ++i) {
-            const char* shortName;
-            g3_player_get_deck_status(&gPlayer, i, &d);
-            if (gWaveRebuildDeck == i)
-                shortName = "~";
-            else if (gDeckFileName[i][0] != '\0')
-                shortName = gDeckFileName[i];
-            else
-                shortName = "-";
-            lm += (size_t)snprintf(mini + lm, sizeof(mini) - lm, "%sD%d:%s %.*s",
-                                   i > 0 ? " | " : "",
-                                   i + 1,
-                                   d.state == G3_TRANSPORT_PLAYING ? "P" : (d.state == G3_TRANSPORT_PAUSED ? "U" : "S"),
-                                   10, shortName);
-        }
-    }
-
-    {
         G3MasterStatus m;
         g3_player_get_master_status(&gPlayer, &m);
         gShownMasterPeakDb = SmoothPeakForDisplay(m.peak_dbfs, gShownMasterPeakDb);
-        snprintf(line, sizeof(line), "MASTER Peak %.0f dBFS  |  %s", (double)gShownMasterPeakDb, mini);
+        snprintf(line, sizeof(line), "MASTER Peak %.0f dBFS", (double)gShownMasterPeakDb);
         if (strcmp(line, gPrevMasterStat) != 0) {
             EraseRect(&gMasterStatusRect);
-            MoveTo(gMasterStatusRect.left + 6, gMasterStatusRect.bottom - 6);
+            MoveTo(gMasterStatusRect.left + 6, masterY);
             DrawCString(line);
             strncpy(gPrevMasterStat, line, sizeof(gPrevMasterStat) - 1);
             gPrevMasterStat[sizeof(gPrevMasterStat) - 1] = '\0';
@@ -1537,7 +2051,7 @@ static void UpdateStatusAreas(void) {
 
     if (!gPrevMsgInit || strcmp(gLastMessage, gPrevMsgDrawn) != 0) {
         EraseRect(&gMessageRect);
-        MoveTo(gMessageRect.left, gMessageRect.bottom - 2);
+        MoveTo(gMessageRect.left, msgY);
         DrawCString(gLastMessage);
         strncpy(gPrevMsgDrawn, gLastMessage, sizeof(gPrevMsgDrawn) - 1);
         gPrevMsgDrawn[sizeof(gPrevMsgDrawn) - 1] = '\0';
@@ -1545,6 +2059,7 @@ static void UpdateStatusAreas(void) {
     }
 
     RefreshPlayPauseButton();
+    RefreshFreezeButton();
 }
 
 static void LayoutUI(void) {
@@ -1597,9 +2112,11 @@ static void LayoutUI(void) {
     top = TRANSPORT_TOP;
     SetRect(&r, left, top, left + 56, top + TR_H);
     gLoadBtn = NewControl(gWindow, &r, "\pLoad", true, 0, 0, 1, pushButProc, 0);
-    SetRect(&r, left + 62, top, left + 146, top + TR_H);
+    SetRect(&r, left + 62, top, left + 128, top + TR_H);
     gPlayBtn = NewControl(gWindow, &r, "\pPlay", true, 0, 0, 1, pushButProc, 0);
-    SetRect(&r, left + 152, top, left + 216, top + TR_H);
+    SetRect(&r, left + 134, top, left + 200, top + TR_H);
+    gFreezeBtn = NewControl(gWindow, &r, "\pFreeze", true, 0, 0, 1, pushButProc, 0);
+    SetRect(&r, left + 206, top, left + 270, top + TR_H);
     gStopBtn = NewControl(gWindow, &r, "\pStop", true, 0, 0, 1, pushButProc, 0);
 
     SetRect(&gWaveRect, left, WAVE_TOP, WAVE_RIGHT, WAVE_BOTTOM);
@@ -1618,7 +2135,7 @@ static void LayoutUI(void) {
     gResetBtn = NewControl(gWindow, &r, "\pDefaults", true, 0, 0, 1, pushButProc, 0);
     SetRect(&r, BTN_CORNER_QUIT_L, BTN_CORNER_TOP, BTN_CORNER_QUIT_R, BTN_CORNER_BOT);
     gQuitBtn = NewControl(gWindow, &r, "\pQuit", true, 0, 0, 1, pushButProc, 0);
-    MoveTo(20, MSG_LABEL_Y);
+    MoveTo(LBL_X, MSG_BASELINE);
     DrawString("\pMessage:");
     FrameRect(&gDeckStatusRect);
     FrameRect(&gMasterStatusRect);
@@ -1741,12 +2258,29 @@ static void HandleDeckButtons(ControlHandle ctrl) {
             g3_player_play(&gPlayer, gUiDeck);
             snprintf(gLastMessage, sizeof(gLastMessage), "Deck %d play.", gUiDeck + 1);
         }
+        gPrevDeckStat[0] = '\0';
+        RedrawVisibleWaveform();
+        UpdateStatusAreas();
+        return;
+    }
+    if (ctrl == gFreezeBtn) {
+        int fr = g3_player_toggle_freeze(&gPlayer, gUiDeck);
+        if (fr < 0)
+            snprintf(gLastMessage, sizeof(gLastMessage), "Deck %d freeze failed (memory?).", gUiDeck + 1);
+        else if (fr > 0)
+            snprintf(gLastMessage, sizeof(gLastMessage), "Deck %d freeze @ %lu ms.", gUiDeck + 1,
+                     (unsigned long)((1000.0 * gPlayer.decks[gUiDeck].frame_pos) / (double)G3_SAMPLE_RATE));
+        else
+            snprintf(gLastMessage, sizeof(gLastMessage), "Deck %d unfrozen, playing.", gUiDeck + 1);
+        gPrevDeckStat[0] = '\0';
+        RedrawVisibleWaveform();
         UpdateStatusAreas();
         return;
     }
     if (ctrl == gStopBtn) {
         g3_player_stop(&gPlayer, gUiDeck);
         snprintf(gLastMessage, sizeof(gLastMessage), "Deck %d stop.", gUiDeck + 1);
+        RedrawVisibleWaveform();
         UpdateStatusAreas();
         return;
     }
@@ -1799,7 +2333,7 @@ static void DoMouseDown(EventRecord* event) {
                         ms = (st.duration_ms > 0) ? (unsigned long)(frac * (double)st.duration_ms) : 0UL;
                         g3_player_seek_ms(&gPlayer, deckHit, ms);
                         snprintf(gLastMessage, sizeof(gLastMessage), "Deck %d seek to %lu ms.", deckHit + 1, ms);
-                        UpdateWaveformPlayhead();
+                        if (deckHit == gUiDeck) RedrawVisibleWaveform();
                         UpdateStatusAreas();
                     }
                     break;
@@ -1843,7 +2377,7 @@ static void DoUpdate(EventRecord* event) {
     InvalidateStaticTextCache();
     DrawControls(w);
     DrawSliderCaptions();
-    MoveTo(20, MSG_LABEL_Y);
+    MoveTo(LBL_X, MSG_BASELINE);
     DrawString("\pMessage:");
     DrawSliderValues();
     DrawWaveformBody();
@@ -1854,7 +2388,7 @@ static void DoUpdate(EventRecord* event) {
 static void InitUI(void) {
     Rect wr;
     SetRect(&wr, 40, 40, 40 + WINDOW_W, 40 + WINDOW_H);
-    gWindow = NewWindow(NULL, &wr, "\pG3 Stage Player v16", true, zoomDocProc, (WindowPtr)-1, true, 0);
+    gWindow = NewWindow(NULL, &wr, "\pG3 Stage Player v26", true, zoomDocProc, (WindowPtr)-1, true, 0);
     SetPort(gWindow);
     EraseRect(&gWindow->portRect);
     LayoutUI();
@@ -1862,7 +2396,7 @@ static void InitUI(void) {
     gSliderActionUPP = NewControlActionProc(SliderAction);
     DrawControls(gWindow);
     DrawSliderCaptions();
-    MoveTo(20, MSG_LABEL_Y);
+    MoveTo(LBL_X, MSG_BASELINE);
     DrawString("\pMessage:");
     DrawSliderValues();
     DrawWaveformBody();

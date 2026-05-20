@@ -8,7 +8,9 @@ CodeWarrior for Mac OS 9 — create a new project and add `src/media-player.c` a
 
 ## Source
 
-`src/media-player.c` — three decks, 44.1 kHz.
+`src/media-player.c` — three decks, 44.1 kHz, freeze/granular cloud per deck.
+
+Freeze captures a window of audio at the playhead and granulates it (tweak `G3_FREEZE_*` / `G3_GRAIN_*` defines at top of source). Each grain picks independent L/R positions in the window and plays them hard-panned (L→left, R→right). Unfreeze resumes normal playback from the frozen position.
 
 ## Releases
 
