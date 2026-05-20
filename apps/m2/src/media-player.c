@@ -618,7 +618,6 @@ int g3_player_render(G3Player* player, short* out_stereo, int frame_count) {
 #define WINDOW_H 656
 #define WAVE_RIGHT (WINDOW_W - 20)
 #define WAVE_POINTS 320
-#define PEAK_DISPLAY_DECAY_DB 2.0f
 #define DEFAULT_DECK_VOL 0.8f
 #define MASTER_DB_MIN (-60.0f)
 #define MASTER_DB_MAX (24.0f)
@@ -713,32 +712,19 @@ static Rect gMessageRect;
 
 static short gWaveMin[G3_DECK_COUNT][WAVE_POINTS];
 static short gWaveMax[G3_DECK_COUNT][WAVE_POINTS];
-static char gDeckFileName[G3_DECK_COUNT][64];
 static char gLastMessage[192] = "Ready.";
 static long gUiTickCounter = 0;
-static int gWaveRebuildDeck = -1;
-static int gWaveRebuildNext = 0;
-static char gPrevDeckStat[384];
-static char gPrevMasterStat[384];
+static char gPrevDeckStat[256];
+static char gPrevMasterStat[256];
 static char gPrevMsgDrawn[192];
 static int gPrevMsgInit = 0;
-static char gPrevSliderVal[SLIDER_VAL_COUNT][64];
-static float gShownDeckPeakDb = -120.0f;
-static float gShownMasterPeakDb = -120.0f;
-static short gWavePlayheadX = -1;
-static int gWaveformBodyDirty = 1;
 static int IsSliderControl(ControlHandle ctrl);
 static int AnyDeckPlaying(void);
 static int WaveHit(Point localPt);
 static void DrawSliderCaptions(void);
-static void InvalidateSliderValueCache(void);
 static void DrawSliderValues(void);
-static void DrawWaveformBody(void);
-static void UpdateWaveformPlayhead(void);
-static void MarkWaveformDirty(void);
+static void DrawWaveforms(void);
 static void UpdateStatusAreas(void);
-static void DoUpdate(EventRecord* event);
-static void UiPumpEvents(void);
 static void ResetAllSlidersToDefaults(void);
 static void SyncVisibleDeckAndMaster(void);
 static void ApplyVisibleDeckSlidersToEngine(void);
@@ -765,96 +751,6 @@ static void DrawCString(const char* src) {
     Str255 p;
     MakePString(src, p);
     DrawString(p);
-}
-
-static void CopyPascalToCString(const unsigned char* pstr, char* dst, size_t dstSize) {
-    unsigned char len;
-    size_t i;
-    if (dst == NULL || dstSize == 0) return;
-    if (pstr == NULL) {
-        dst[0] = '\0';
-        return;
-    }
-    len = pstr[0];
-    if ((size_t)len >= dstSize) len = (unsigned char)(dstSize - 1);
-    for (i = 0; i < (size_t)len; ++i) dst[i] = (char)pstr[i + 1];
-    dst[len] = '\0';
-}
-
-static void SetDeckFileNameFromFSSpec(int deck_index, const FSSpec* spec) {
-    if (deck_index < 0 || deck_index >= G3_DECK_COUNT || spec == NULL) return;
-    CopyPascalToCString((const unsigned char*)spec->name, gDeckFileName[deck_index],
-                        sizeof(gDeckFileName[deck_index]));
-}
-
-static void UiPumpEvents(void) {
-    EventRecord ev;
-    while (WaitNextEvent(everyEvent, &ev, 0, NULL)) {
-        if (ev.what == updateEvt && (WindowPtr)ev.message == gWindow)
-            DoUpdate(&ev);
-    }
-    SyncVisibleDeckAndMaster();
-    UpdateStatusAreas();
-}
-
-static void FreeDeckSamplesSafe(G3Deck* deck) {
-    short* old;
-    if (deck == NULL) return;
-    old = deck->wav.samples;
-    if (old == NULL) return;
-    deck->loaded = 0;
-    deck->wav.samples = NULL;
-    deck->wav.frame_count = 0;
-    deck->wav.channels = 0;
-    deck->state = G3_TRANSPORT_STOPPED;
-    deck->frame_pos = 0.0;
-    deck->speed_current = 0.0;
-    deck->speed_target = 0.0;
-    UiPumpEvents();
-    UiPumpEvents();
-    free(old);
-}
-
-#if defined(__POWERPC__) || defined(__ppc__) || defined(powerc) || defined(__CFM68K__) || \
-    (defined(__BIG_ENDIAN__) && __BIG_ENDIAN__)
-static void g3_pcm16_le_to_host_yield(short* samples, unsigned long pcm_bytes) {
-    unsigned char* b = (unsigned char*)samples;
-    unsigned long pos = 0;
-    const unsigned long chunk_bytes = 65536UL;
-    while (pos + 1 < pcm_bytes) {
-        unsigned long end = pos + chunk_bytes;
-        unsigned long i;
-        if (end > pcm_bytes) end = pcm_bytes;
-        if (end & 1u) end--;
-        for (i = pos; i + 1 < end; i += 2) {
-            unsigned char t = b[i];
-            b[i] = b[i + 1];
-            b[i + 1] = t;
-        }
-        pos = end;
-        UiPumpEvents();
-    }
-}
-#else
-static void g3_pcm16_le_to_host_yield(short* samples, unsigned long pcm_bytes) {
-    (void)samples;
-    (void)pcm_bytes;
-}
-#endif
-
-static OSErr ReadFileBytesWithPump(short refNum, void* dst, unsigned long totalBytes) {
-    unsigned char* p = (unsigned char*)dst;
-    unsigned long remaining = totalBytes;
-    const unsigned long blockSize = 65536UL;
-    while (remaining > 0) {
-        long readCount = (long)((remaining > blockSize) ? blockSize : remaining);
-        OSErr err = FSRead(refNum, &readCount, p);
-        if (err != noErr || readCount <= 0) return (err != noErr) ? err : -1;
-        p += readCount;
-        remaining -= (unsigned long)readCount;
-        UiPumpEvents();
-    }
-    return noErr;
 }
 
 static short VolToSlider(float v) {
@@ -935,17 +831,6 @@ static void FormatClock(unsigned long ms, char* out, int out_len) {
     snprintf(out, (size_t)out_len, "%lu:%02lu", m, s);
 }
 
-static float SmoothPeakForDisplay(float current, float shown) {
-    if (current > shown) return current;
-    if (current < shown - PEAK_DISPLAY_DECAY_DB) return current;
-    return shown;
-}
-
-static void MarkWaveformDirty(void) {
-    gWaveformBodyDirty = 1;
-    gWavePlayheadX = -1;
-}
-
 static int AnyDeckPlaying(void) {
     int i;
     for (i = 0; i < G3_DECK_COUNT; ++i) {
@@ -987,10 +872,8 @@ static void SwitchToDeck(int deckIndex) {
     ApplyVisibleDeckSlidersToEngine();
     gUiDeck = deckIndex;
     LoadDeckSlidersFromEngine(gUiDeck);
-    MarkWaveformDirty();
-    InvalidateSliderValueCache();
     DrawSliderValues();
-    DrawWaveformBody();
+    DrawWaveforms();
     snprintf(gLastMessage, sizeof(gLastMessage), "Editing deck %d (all decks still mix).", gUiDeck + 1);
     UpdateStatusAreas();
 }
@@ -1129,80 +1012,48 @@ static void RefreshPlayPauseButton(void) {
     Draw1Control(gPlayBtn);
 }
 
-static void RebuildWaveformBucket(int deck_index, int point_index) {
+static void RebuildWaveform(int deck_index) {
     G3Deck* deck;
-    unsigned long start;
-    unsigned long end;
-    long mn;
-    long mx;
-    unsigned long f;
+    long i;
     if (deck_index < 0 || deck_index >= G3_DECK_COUNT) return;
-    if (point_index < 0 || point_index >= WAVE_POINTS) return;
     deck = &gPlayer.decks[deck_index];
-    if (!deck->loaded || deck->wav.frame_count == 0 || deck->wav.samples == NULL) {
-        gWaveMin[deck_index][point_index] = 0;
-        gWaveMax[deck_index][point_index] = 0;
-        return;
-    }
 
-    start = (unsigned long)(((double)point_index * (double)deck->wav.frame_count) / (double)WAVE_POINTS);
-    end = (unsigned long)(((double)(point_index + 1) * (double)deck->wav.frame_count) / (double)WAVE_POINTS);
-    mn = 32767;
-    mx = -32768;
-    if (end <= start) end = start + 1;
-    if (end > deck->wav.frame_count) end = deck->wav.frame_count;
-    for (f = start; f < end; ++f) {
-        long s;
-        if (deck->wav.channels == 1) {
-            s = deck->wav.samples[f];
-        } else {
-            long l = deck->wav.samples[(f * 2) + 0];
-            long r = deck->wav.samples[(f * 2) + 1];
-            s = (l + r) / 2;
-        }
-        if (s < mn) mn = s;
-        if (s > mx) mx = s;
-    }
-    if (mn > mx) {
-        mn = 0;
-        mx = 0;
-    }
-    gWaveMin[deck_index][point_index] = (short)mn;
-    gWaveMax[deck_index][point_index] = (short)mx;
-}
-
-static void StartWaveformRebuild(int deck_index) {
-    int i;
-    if (deck_index < 0 || deck_index >= G3_DECK_COUNT) return;
     for (i = 0; i < WAVE_POINTS; ++i) {
         gWaveMin[deck_index][i] = 0;
         gWaveMax[deck_index][i] = 0;
     }
-    gWaveRebuildDeck = deck_index;
-    gWaveRebuildNext = 0;
-}
+    if (!deck->loaded || deck->wav.frame_count == 0 || deck->wav.samples == NULL) return;
 
-static int AdvanceWaveformRebuild(int max_points) {
-    int built = 0;
-    if (gWaveRebuildDeck < 0 || gWaveRebuildDeck >= G3_DECK_COUNT) return 0;
-    while (gWaveRebuildNext < WAVE_POINTS && built < max_points) {
-        RebuildWaveformBucket(gWaveRebuildDeck, gWaveRebuildNext);
-        gWaveRebuildNext++;
-        built++;
-    }
-    if (gWaveRebuildNext >= WAVE_POINTS) {
-        int done_deck = gWaveRebuildDeck;
-        gWaveRebuildDeck = -1;
-        gWaveRebuildNext = 0;
-        if (done_deck == gUiDeck) {
-            MarkWaveformDirty();
-            DrawWaveformBody();
+    for (i = 0; i < WAVE_POINTS; ++i) {
+        unsigned long start = (unsigned long)(((double)i * (double)deck->wav.frame_count) / (double)WAVE_POINTS);
+        unsigned long end = (unsigned long)(((double)(i + 1) * (double)deck->wav.frame_count) / (double)WAVE_POINTS);
+        long mn = 32767;
+        long mx = -32768;
+        unsigned long f;
+        if (end <= start) end = start + 1;
+        if (end > deck->wav.frame_count) end = deck->wav.frame_count;
+        for (f = start; f < end; ++f) {
+            long s;
+            if (deck->wav.channels == 1) {
+                s = deck->wav.samples[f];
+            } else {
+                long l = deck->wav.samples[(f * 2) + 0];
+                long r = deck->wav.samples[(f * 2) + 1];
+                s = (l + r) / 2;
+            }
+            if (s < mn) mn = s;
+            if (s > mx) mx = s;
         }
+        if (mn > mx) {
+            mn = 0;
+            mx = 0;
+        }
+        gWaveMin[deck_index][i] = (short)mn;
+        gWaveMax[deck_index][i] = (short)mx;
     }
-    return built;
 }
 
-static void DrawWaveformBody(void) {
+static void DrawWaveforms(void) {
     int d = gUiDeck;
     G3DeckStatus st;
     Rect r = gWaveRect;
@@ -1211,7 +1062,6 @@ static void DrawWaveformBody(void) {
     int mid;
     long play_x;
     SetPort(gWindow);
-    PenMode(patCopy);
     EraseRect(&r);
     FrameRect(&r);
     g3_player_get_deck_status(&gPlayer, d, &st);
@@ -1226,60 +1076,13 @@ static void DrawWaveformBody(void) {
         LineTo(x, y2);
     }
 
-    gWavePlayheadX = -1;
     if (st.loaded && st.duration_ms > 0) {
         play_x = (long)((((double)st.position_ms / (double)st.duration_ms) * (double)w));
         if (play_x < 0) play_x = 0;
         if (play_x > w) play_x = w;
         MoveTo(r.left + 1 + (short)play_x, r.top + 1);
         LineTo(r.left + 1 + (short)play_x, r.bottom - 1);
-        gWavePlayheadX = (short)play_x;
     }
-    gWaveformBodyDirty = 0;
-}
-
-static void UpdateWaveformPlayhead(void) {
-    int d = gUiDeck;
-    G3DeckStatus st;
-    Rect r = gWaveRect;
-    int w;
-    long play_x;
-    short x0;
-    if (gWaveformBodyDirty || gWindow == NULL) return;
-    g3_player_get_deck_status(&gPlayer, d, &st);
-    if (!st.loaded || st.duration_ms == 0) {
-        if (gWavePlayheadX >= 0) {
-            SetPort(gWindow);
-            PenMode(patXor);
-            PenSize(1, 1);
-            x0 = (short)(r.left + 1 + gWavePlayheadX);
-            MoveTo(x0, (short)(r.top + 1));
-            LineTo(x0, (short)(r.bottom - 1));
-            PenMode(patCopy);
-            gWavePlayheadX = -1;
-        }
-        return;
-    }
-
-    w = r.right - r.left - 2;
-    play_x = (long)((((double)st.position_ms / (double)st.duration_ms) * (double)w));
-    if (play_x < 0) play_x = 0;
-    if (play_x > w) play_x = w;
-    if (play_x == (long)gWavePlayheadX) return;
-
-    SetPort(gWindow);
-    PenMode(patXor);
-    PenSize(1, 1);
-    if (gWavePlayheadX >= 0) {
-        x0 = (short)(r.left + 1 + gWavePlayheadX);
-        MoveTo(x0, (short)(r.top + 1));
-        LineTo(x0, (short)(r.bottom - 1));
-    }
-    x0 = (short)(r.left + 1 + play_x);
-    MoveTo(x0, (short)(r.top + 1));
-    LineTo(x0, (short)(r.bottom - 1));
-    PenMode(patCopy);
-    gWavePlayheadX = (short)play_x;
 }
 
 static int LoadDeckFromFSSpec(int deck_index, const FSSpec* spec) {
@@ -1360,11 +1163,9 @@ static int LoadDeckFromFSSpec(int deck_index, const FSSpec* spec) {
                 snprintf(gLastMessage, sizeof(gLastMessage), "Deck %d load failed: out of memory.", deck_index + 1);
                 return 0;
             }
-            snprintf(gLastMessage, sizeof(gLastMessage), "Deck %d: reading audio...", deck_index + 1);
-            gPrevMsgInit = 0;
-            UiPumpEvents();
-            err = ReadFileBytesWithPump(refNum, pcm, pcmBytes);
-            if (err != noErr) {
+            readCount = (long)pcmBytes;
+            err = FSRead(refNum, &readCount, pcm);
+            if (err != noErr || (unsigned long)readCount != pcmBytes) {
                 free(pcm);
                 FSClose(refNum);
                 snprintf(gLastMessage, sizeof(gLastMessage), "Deck %d load failed: data read error %d.", deck_index + 1, (int)err);
@@ -1384,12 +1185,9 @@ static int LoadDeckFromFSSpec(int deck_index, const FSSpec* spec) {
         return 0;
     }
 
-    snprintf(gLastMessage, sizeof(gLastMessage), "Deck %d: preparing audio...", deck_index + 1);
-    gPrevMsgInit = 0;
-    UiPumpEvents();
-    g3_pcm16_le_to_host_yield(pcm, pcmBytes);
+    g3_pcm16_le_to_host(pcm, pcmBytes);
 
-    FreeDeckSamplesSafe(deck);
+    g3_player_unload(&gPlayer, deck_index);
     deck->wav.samples = pcm;
     deck->wav.channels = (int)fmtChannels;
     deck->wav.frame_count = pcmBytes / (unsigned long)(fmtChannels * 2);
@@ -1400,101 +1198,70 @@ static int LoadDeckFromFSSpec(int deck_index, const FSSpec* spec) {
     deck->speed_target = 0.0;
     deck->peak_linear = 0.0f;
 
-    SetDeckFileNameFromFSSpec(deck_index, spec);
-    gPrevDeckStat[0] = '\0';
-    gPrevMasterStat[0] = '\0';
-    snprintf(gLastMessage, sizeof(gLastMessage), "Deck %d loaded: %s", deck_index + 1, gDeckFileName[deck_index]);
-    StartWaveformRebuild(deck_index);
-    if (deck_index == gUiDeck) {
-        MarkWaveformDirty();
-        DrawWaveformBody();
-    }
+    snprintf(gLastMessage, sizeof(gLastMessage), "Deck %d loaded OK.", deck_index + 1);
+    RebuildWaveform(deck_index);
     return 1;
 }
 
 static int PickAndLoadDeckFile(int deck_index) {
     StandardFileReply reply;
-    int ok;
     if (deck_index < 0 || deck_index >= G3_DECK_COUNT) return 0;
 
     StandardGetFile(NULL, -1, NULL, &reply);
     if (!reply.sfGood) return 0;
-
-    snprintf(gLastMessage, sizeof(gLastMessage), "Deck %d: loading...", deck_index + 1);
-    gPrevMsgInit = 0;
-    gPrevDeckStat[0] = '\0';
-    UpdateStatusAreas();
-    ok = LoadDeckFromFSSpec(deck_index, &reply.sfFile);
-    return ok;
-}
-
-static void DrawSliderValueCached(int index, const char* text, short baselineY) {
-    if (strcmp(text, gPrevSliderVal[index]) == 0) return;
-    SetPort(gWindow);
-    EraseRect(&gSliderValueRect[index]);
-    MoveTo(gSliderValueRect[index].left, baselineY);
-    DrawCString(text);
-    strncpy(gPrevSliderVal[index], text, sizeof(gPrevSliderVal[index]) - 1);
-    gPrevSliderVal[index][sizeof(gPrevSliderVal[index]) - 1] = '\0';
-}
-
-static void InvalidateSliderValueCache(void) {
-    int i;
-    for (i = 0; i < SLIDER_VAL_COUNT; ++i) gPrevSliderVal[i][0] = '\0';
+    return LoadDeckFromFSSpec(deck_index, &reply.sfFile);
 }
 
 static void DrawSliderValues(void) {
     char text[64];
+    SetPort(gWindow);
 
+    EraseRect(&gSliderValueRect[0]);
     snprintf(text, sizeof(text), "%+.1f dB", (double)DeckVolLinearToDb(SliderToVol(GetControlValue(gVolSlider))));
-    DrawSliderValueCached(0, text, (short)(SL0_TOP + 0 * ROW_STEP + SL_TRACK_TEXT_BASE));
+    MoveTo(gSliderValueRect[0].left, (short)(SL0_TOP + 0 * ROW_STEP + SL_TRACK_TEXT_BASE));
+    DrawCString(text);
 
+    EraseRect(&gSliderValueRect[1]);
     snprintf(text, sizeof(text), "%.2f", SliderToPan(GetControlValue(gPanSlider)));
-    DrawSliderValueCached(1, text, (short)(SL0_TOP + 1 * ROW_STEP + SL_TRACK_TEXT_BASE));
+    MoveTo(gSliderValueRect[1].left, (short)(SL0_TOP + 1 * ROW_STEP + SL_TRACK_TEXT_BASE));
+    DrawCString(text);
 
+    EraseRect(&gSliderValueRect[2]);
     snprintf(text, sizeof(text), "%.1f%%", SliderToPitch(GetControlValue(gPitchSlider)));
-    DrawSliderValueCached(2, text, (short)(SL0_TOP + 2 * ROW_STEP + SL_TRACK_TEXT_BASE));
+    MoveTo(gSliderValueRect[2].left, (short)(SL0_TOP + 2 * ROW_STEP + SL_TRACK_TEXT_BASE));
+    DrawCString(text);
 
+    EraseRect(&gSliderValueRect[3]);
     snprintf(text, sizeof(text), "%d ms", (int)GetControlValue(gRampSlider));
-    DrawSliderValueCached(3, text, (short)(SL0_TOP + 3 * ROW_STEP + SL_TRACK_TEXT_BASE));
+    MoveTo(gSliderValueRect[3].left, (short)(SL0_TOP + 3 * ROW_STEP + SL_TRACK_TEXT_BASE));
+    DrawCString(text);
 
+    EraseRect(&gSliderValueRect[4]);
     snprintf(text, sizeof(text), "%+.1f dB", (double)SliderToMasterDb(GetControlValue(gMasterSlider)));
-    DrawSliderValueCached(4, text, MASTER_LBL_BASELINE);
+    MoveTo(gSliderValueRect[4].left, MASTER_LBL_BASELINE);
+    DrawCString(text);
 }
 
 static void UpdateStatusAreas(void) {
     int i;
-    char line[384];
-    char mini[384];
+    char line[256];
+    char mini[128];
     G3DeckStatus d;
     char pos[16];
     char dur[16];
-    const char* fileLabel;
-    static int s_peakDeck = -1;
     SetPort(gWindow);
 
-    if (s_peakDeck != gUiDeck) {
-        s_peakDeck = gUiDeck;
-        gShownDeckPeakDb = -120.0f;
-    }
-
     g3_player_get_deck_status(&gPlayer, gUiDeck, &d);
-    gShownDeckPeakDb = SmoothPeakForDisplay(d.peak_dbfs, gShownDeckPeakDb);
     FormatClock(d.position_ms, pos, sizeof(pos));
     FormatClock(d.duration_ms, dur, sizeof(dur));
-    if (gWaveRebuildDeck == gUiDeck)
-        fileLabel = "(building waveform)";
-    else if (gDeckFileName[gUiDeck][0] != '\0')
-        fileLabel = gDeckFileName[gUiDeck];
-    else
-        fileLabel = "(no file)";
     snprintf(line, sizeof(line),
-             "Deck %d  %s  %s  %s / %s  Peak %.0f dBFS",
+             "Deck %d  %s  %s / %s  Peak %.0f dBFS",
              gUiDeck + 1,
              d.state == G3_TRANSPORT_PLAYING ? "PLAY" : (d.state == G3_TRANSPORT_PAUSED ? "PAUSE" : "STOP"),
-             fileLabel, pos, dur, (double)gShownDeckPeakDb);
+             pos, dur, (double)d.peak_dbfs);
     if (strcmp(line, gPrevDeckStat) != 0) {
         EraseRect(&gDeckStatusRect);
+        FrameRect(&gDeckStatusRect);
         MoveTo(gDeckStatusRect.left + 6, gDeckStatusRect.bottom - 6);
         DrawCString(line);
         strncpy(gPrevDeckStat, line, sizeof(gPrevDeckStat) - 1);
@@ -1505,29 +1272,21 @@ static void UpdateStatusAreas(void) {
         size_t lm = 0;
         mini[0] = '\0';
         for (i = 0; i < G3_DECK_COUNT; ++i) {
-            const char* shortName;
             g3_player_get_deck_status(&gPlayer, i, &d);
-            if (gWaveRebuildDeck == i)
-                shortName = "~";
-            else if (gDeckFileName[i][0] != '\0')
-                shortName = gDeckFileName[i];
-            else
-                shortName = "-";
-            lm += (size_t)snprintf(mini + lm, sizeof(mini) - lm, "%sD%d:%s %.*s",
-                                   i > 0 ? " | " : "",
+            lm += (size_t)snprintf(mini + lm, sizeof(mini) - lm, "%sD%d:%s",
+                                   i > 0 ? " " : "",
                                    i + 1,
-                                   d.state == G3_TRANSPORT_PLAYING ? "P" : (d.state == G3_TRANSPORT_PAUSED ? "U" : "S"),
-                                   10, shortName);
+                                   d.state == G3_TRANSPORT_PLAYING ? "P" : (d.state == G3_TRANSPORT_PAUSED ? "U" : "S"));
         }
     }
 
     {
         G3MasterStatus m;
         g3_player_get_master_status(&gPlayer, &m);
-        gShownMasterPeakDb = SmoothPeakForDisplay(m.peak_dbfs, gShownMasterPeakDb);
-        snprintf(line, sizeof(line), "MASTER Peak %.0f dBFS  |  %s", (double)gShownMasterPeakDb, mini);
+        snprintf(line, sizeof(line), "MASTER Peak %.0f dBFS  |  %s", (double)m.peak_dbfs, mini);
         if (strcmp(line, gPrevMasterStat) != 0) {
             EraseRect(&gMasterStatusRect);
+            FrameRect(&gMasterStatusRect);
             MoveTo(gMasterStatusRect.left + 6, gMasterStatusRect.bottom - 6);
             DrawCString(line);
             strncpy(gPrevMasterStat, line, sizeof(gPrevMasterStat) - 1);
@@ -1620,8 +1379,6 @@ static void LayoutUI(void) {
     gQuitBtn = NewControl(gWindow, &r, "\pQuit", true, 0, 0, 1, pushButProc, 0);
     MoveTo(20, MSG_LABEL_Y);
     DrawString("\pMessage:");
-    FrameRect(&gDeckStatusRect);
-    FrameRect(&gMasterStatusRect);
 }
 
 static pascal void SliderAction(ControlHandle control, short partCode) {
@@ -1729,8 +1486,7 @@ static void HandleDeckButtons(ControlHandle ctrl) {
         PickAndLoadDeckFile(gUiDeck);
         DrawSliderValues();
         UpdateStatusAreas();
-        MarkWaveformDirty();
-        DrawWaveformBody();
+        DrawWaveforms();
         return;
     }
     if (ctrl == gPlayBtn) {
@@ -1799,7 +1555,7 @@ static void DoMouseDown(EventRecord* event) {
                         ms = (st.duration_ms > 0) ? (unsigned long)(frac * (double)st.duration_ms) : 0UL;
                         g3_player_seek_ms(&gPlayer, deckHit, ms);
                         snprintf(gLastMessage, sizeof(gLastMessage), "Deck %d seek to %lu ms.", deckHit + 1, ms);
-                        UpdateWaveformPlayhead();
+                        DrawWaveforms();
                         UpdateStatusAreas();
                     }
                     break;
@@ -1831,8 +1587,6 @@ static void InvalidateStaticTextCache(void) {
     gPrevDeckStat[0] = '\0';
     gPrevMasterStat[0] = '\0';
     gPrevMsgInit = 0;
-    InvalidateSliderValueCache();
-    MarkWaveformDirty();
 }
 
 static void DoUpdate(EventRecord* event) {
@@ -1846,7 +1600,7 @@ static void DoUpdate(EventRecord* event) {
     MoveTo(20, MSG_LABEL_Y);
     DrawString("\pMessage:");
     DrawSliderValues();
-    DrawWaveformBody();
+    DrawWaveforms();
     UpdateStatusAreas();
     EndUpdate(w);
 }
@@ -1854,7 +1608,7 @@ static void DoUpdate(EventRecord* event) {
 static void InitUI(void) {
     Rect wr;
     SetRect(&wr, 40, 40, 40 + WINDOW_W, 40 + WINDOW_H);
-    gWindow = NewWindow(NULL, &wr, "\pG3 Stage Player v16", true, zoomDocProc, (WindowPtr)-1, true, 0);
+    gWindow = NewWindow(NULL, &wr, "\pG3 Stage Player v14", true, zoomDocProc, (WindowPtr)-1, true, 0);
     SetPort(gWindow);
     EraseRect(&gWindow->portRect);
     LayoutUI();
@@ -1865,7 +1619,7 @@ static void InitUI(void) {
     MoveTo(20, MSG_LABEL_Y);
     DrawString("\pMessage:");
     DrawSliderValues();
-    DrawWaveformBody();
+    DrawWaveforms();
     InvalidateStaticTextCache();
     UpdateStatusAreas();
 }
@@ -1905,11 +1659,7 @@ int main(void) {
             }
         }
         gUiTickCounter++;
-        if (gWaveRebuildDeck >= 0) AdvanceWaveformRebuild(8);
-        if (gWaveformBodyDirty)
-            DrawWaveformBody();
-        else if (AnyDeckPlaying() && (gUiTickCounter % 2) == 0)
-            UpdateWaveformPlayhead();
+        if ((gUiTickCounter % 20) == 0 && AnyDeckPlaying()) DrawWaveforms();
         if ((gUiTickCounter % 8) == 0) UpdateStatusAreas();
     }
 
