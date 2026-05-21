@@ -27,12 +27,22 @@
 #define kLoadWidth            96
 #define kLoadHeight           24
 
-#define kPlayLeft             132
+#define kSavePatchLeft        124
+#define kSavePatchTop         50
+#define kSavePatchWidth       88
+#define kSavePatchHeight      24
+
+#define kOpenPatchLeft        220
+#define kOpenPatchTop         50
+#define kOpenPatchWidth       88
+#define kOpenPatchHeight      24
+
+#define kPlayLeft             316
 #define kPlayTop              50
 #define kPlayWidth            96
 #define kPlayHeight           24
 
-#define kResetPitchLeft       244
+#define kResetPitchLeft       428
 #define kResetPitchTop        50
 #define kResetPitchWidth      120
 #define kResetPitchHeight     24
@@ -43,10 +53,15 @@
 #define kFadeModeWidth        200
 #define kFadeModeHeight         20
 
-#define kAssignLeft           488
+#define kAssignLeft           552
 #define kAssignTop            50
 #define kAssignWidth          104
 #define kAssignHeight         24
+
+#define kRecordLeft           664
+#define kRecordTop            50
+#define kRecordWidth          88
+#define kRecordHeight         24
 
 #define kQuitLeft             720
 #define kQuitTop              776
@@ -84,6 +99,17 @@
 #define kPresetFadeMSDefault  2500L
 #define kDefaultWindowEndMS   2000L
 #define kWaveMarkerRefreshSteps 32
+
+#define kRecordSampleRate       44100UL
+#define kRecordStagingFrames    512L
+#define kRecordRingFrames       32768L
+#define kRecordDrainMaxFrames   4096L
+#define kRecordMaxPushesPerFrame 8
+#define kWAVHeaderBytes         44L
+
+#define kGranPatchMagic         0x314E5247L  /* 'GRN1' */
+#define kGranPatchVersion       1L
+#define kGranPatchWavNameMax    63
 
 #ifndef inUpButton
 #define inUpButton 20
@@ -128,17 +154,41 @@ static WindowPtr      gWindow = NULL;
 static Boolean        gDone = false;
 
 static Rect           gLoadRect;
+static Rect           gSavePatchRect;
+static Rect           gOpenPatchRect;
 static Rect           gPlayRect;
 static Rect           gResetPitchRect;
 static Rect           gAssignRect;
+static Rect           gRecordRect;
 static Rect           gQuitRect;
 static Rect           gWaveRect;
 
 static ControlHandle  gLoadButton = NULL;
+static ControlHandle  gSavePatchButton = NULL;
+static ControlHandle  gOpenPatchButton = NULL;
 static ControlHandle  gPlayButton = NULL;
 static ControlHandle  gResetPitchButton = NULL;
 static ControlHandle  gAssignButton = NULL;
+static ControlHandle  gRecordButton = NULL;
 static ControlHandle  gQuitButton = NULL;
+
+static Boolean        gRecording = false;
+static short          gRecordRefNum = 0;
+static unsigned long  gRecordBytesWritten = 0;
+static unsigned long  gRecordPhase = 0;
+static short          gRecordPrevL = 0;
+static short          gRecordPrevR = 0;
+static long           gRecordStagingCount = 0;
+static unsigned char  gRecordStagingBytes[kRecordStagingFrames * 4L];
+static short          *gRecordRing = NULL;
+static volatile long  gRecordRingWrite = 0;
+static volatile long  gRecordRingRead = 0;
+static Boolean        gRecordRingOverflow = false;
+static Boolean        gRecordOverflowReported = false;
+static volatile Boolean gSuppressAudioOutput = false;
+static Boolean        gRecordStartPending = false;
+static FSSpec         gRecordPendingSpec;
+static Boolean        gWaveOnlyUpdateHint = false;
 static ControlActionUPP gSliderActionUPP = NULL;
 static ControlHandle  gStartControl = NULL;
 static ControlHandle  gEndControl = NULL;
@@ -213,6 +263,7 @@ static long           gWaveBuildNext = 0;
 static FSSpec         gLoadedSpec;
 static Boolean        gHasLoadedFile = false;
 static Boolean        gLoadPending = false;
+static Boolean        gPendingPatchApply = false;
 static FSSpec         gPendingLoadSpec;
 static Boolean        gInSliderTrack = false;
 static Boolean        gNeedsFullRedraw = false;
@@ -341,8 +392,27 @@ static void DrawWaveformEnvelopeOutline(const Rect *r, int w, int mid);
 static void DrawWaveformBody(const Rect *r, int w, int mid);
 static void EraseMarkerAtX(int x, const Rect *r);
 static void DrawWaveformTransitionFull(void);
+static Boolean WaveformShowsTransitionMarkers(void);
+static void WaveformRepaintNow(void);
+static void StagingAppendStereoLE(short left, short right);
 static void DrawLoopWindowMarkers(const Rect *r, int w, long startFrame, long endFrame, const RGBColor *color);
 static void RefreshWaveformMarkers(void);
+static void WriteLE16(unsigned char *p, unsigned short value);
+static void BuildPCM44WAVHeader(unsigned char *hdr, unsigned long dataBytes);
+static void FlushRecordStaging(void);
+static void FreeRecordRing(void);
+static void ResetRecordRing(void);
+static void DrainRecordRingToDisk(void);
+static void RecordRingPushStereo(short left, short right);
+static OSErr CommitRecordingToFile(const FSSpec *spec);
+static OSErr PromptRecordOutputFile(FSSpec *spec);
+static OSErr FinishRecording(void);
+static void StopRecordingSilently(void);
+static void RecordEngineStereoFrame(short left, short right);
+static void DrawRecordButton(void);
+static void UpdateRecordButton(void);
+static void ToggleRecord(void);
+static Boolean ChooseRecordFile(Str255 defaultName, FSSpec *spec);
 static void LoopFramesFromNorms(long startNorm, long endNorm, long *outStartFrame, long *outEndFrame);
 static long PresetFadeMSFromNorm(long normValue);
 static Boolean SpawnVoiceInRange(long loopStart, long loopEnd, short outputMode,
@@ -361,7 +431,20 @@ static void CommitSliderChange(ControlHandle control);
 static void SliderActionLive(ControlHandle control);
 
 static Boolean ChooseWAVFile(FSSpec *spec);
+static Boolean ChooseSavePatchFile(Str255 defaultName, FSSpec *spec);
+static Boolean ChooseOpenPatchFile(FSSpec *spec);
 static OSErr LoadEntireFile(const FSSpec *spec, Ptr *outData, long *outSize);
+static OSErr WriteEntireFile(const FSSpec *spec, Ptr data, long size);
+static OSErr CopyFileSpec(const FSSpec *src, const FSSpec *dst);
+static void StripFilenameExtension(Str255 name);
+static void SetFilenameExtension(Str255 name, ConstStr255Param ext);
+static void BaseNameFromFilename(ConstStr255Param src, Str255 outBase);
+static OSErr BuildSiblingFileSpec(const FSSpec *sibling, ConstStr255Param fileName, FSSpec *outSpec);
+static OSErr SaveGranPatch(const FSSpec *patchSpec);
+static OSErr LoadGranPatch(const FSSpec *patchSpec);
+static void ApplyPatchSettingsToUI(void);
+static void SavePatchAction(void);
+static void OpenPatchAction(void);
 static unsigned long ReadLE32(const unsigned char *p);
 static unsigned short ReadLE16(const unsigned char *p);
 static OSErr FindWAVChunks(Ptr fileData, long fileSize, Ptr *outFmtPtr, long *outFmtSize, Ptr *outDataPtr, long *outDataSize);
@@ -642,6 +725,712 @@ static unsigned short ReadLE16(const unsigned char *p)
     return (unsigned short)(((unsigned short)p[0]) | (((unsigned short)p[1]) << 8));
 }
 
+static void WriteLE32(unsigned char *p, unsigned long value)
+{
+    p[0] = (unsigned char)(value & 0xFFUL);
+    p[1] = (unsigned char)((value >> 8) & 0xFFUL);
+    p[2] = (unsigned char)((value >> 16) & 0xFFUL);
+    p[3] = (unsigned char)((value >> 24) & 0xFFUL);
+}
+
+static void WriteLE16(unsigned char *p, unsigned short value)
+{
+    p[0] = (unsigned char)(value & 0xFFU);
+    p[1] = (unsigned char)((value >> 8) & 0xFFU);
+}
+
+static void BuildPCM44WAVHeader(unsigned char *hdr, unsigned long dataBytes)
+{
+    unsigned long chunkSize = 36UL + dataBytes;
+
+    hdr[0] = 'R'; hdr[1] = 'I'; hdr[2] = 'F'; hdr[3] = 'F';
+    WriteLE32(hdr + 4, chunkSize);
+    hdr[8] = 'W'; hdr[9] = 'A'; hdr[10] = 'V'; hdr[11] = 'E';
+    hdr[12] = 'f'; hdr[13] = 'm'; hdr[14] = 't'; hdr[15] = ' ';
+    WriteLE32(hdr + 16, 16UL);
+    WriteLE16(hdr + 20, 1);
+    WriteLE16(hdr + 22, 2);
+    WriteLE32(hdr + 24, kRecordSampleRate);
+    WriteLE32(hdr + 28, kRecordSampleRate * 4UL);
+    WriteLE16(hdr + 32, 4);
+    WriteLE16(hdr + 34, 16);
+    hdr[36] = 'd'; hdr[37] = 'a'; hdr[38] = 't'; hdr[39] = 'a';
+    WriteLE32(hdr + 40, dataBytes);
+}
+
+static Boolean ChooseRecordFile(Str255 defaultName, FSSpec *spec)
+{
+    StandardFileReply reply;
+
+    if (spec == NULL) return false;
+    StandardPutFile("\pRecord output as:", defaultName, &reply);
+    if (!reply.sfGood) return false;
+    *spec = reply.sfFile;
+    return true;
+}
+
+static void StagingAppendStereoLE(short left, short right)
+{
+    long off;
+
+    if (gRecordStagingCount >= kRecordStagingFrames) return;
+
+    off = gRecordStagingCount * 4L;
+    WriteLE16(gRecordStagingBytes + off, (unsigned short)left);
+    WriteLE16(gRecordStagingBytes + off + 2, (unsigned short)right);
+    gRecordStagingCount++;
+}
+
+static void FlushRecordStaging(void)
+{
+    long bytes;
+    OSErr err;
+
+    if (gRecordRefNum == 0 || gRecordStagingCount <= 0L) return;
+
+    bytes = gRecordStagingCount * 4L;
+    err = FSWrite(gRecordRefNum, &bytes, (Ptr)gRecordStagingBytes);
+    if (err == noErr) {
+        gRecordBytesWritten += (unsigned long)bytes;
+    }
+    gRecordStagingCount = 0L;
+}
+
+static void FreeRecordRing(void)
+{
+    if (gRecordRing != NULL) {
+        DisposePtr((Ptr)gRecordRing);
+        gRecordRing = NULL;
+    }
+    ResetRecordRing();
+}
+
+static void ResetRecordRing(void)
+{
+    gRecordRingWrite = 0L;
+    gRecordRingRead = 0L;
+    gRecordRingOverflow = false;
+    gRecordOverflowReported = false;
+}
+
+static void RecordRingPushStereo(short left, short right)
+{
+    long w;
+    long next;
+
+    if (gRecordRing == NULL) return;
+
+    w = gRecordRingWrite;
+    next = w + 1L;
+    if (next >= kRecordRingFrames) next = 0L;
+    if (next == gRecordRingRead) {
+        gRecordRingOverflow = true;
+        return;
+    }
+
+    gRecordRing[w * 2L + 0L] = left;
+    gRecordRing[w * 2L + 1L] = right;
+    gRecordRingWrite = next;
+}
+
+static void DrainRecordRingToDisk(void)
+{
+    long drained = 0L;
+
+    if (gRecordRefNum == 0 || gRecordRing == NULL) return;
+
+    while (gRecordRingRead != gRecordRingWrite &&
+           gRecordStagingCount < kRecordStagingFrames &&
+           drained < kRecordDrainMaxFrames) {
+        long r = gRecordRingRead;
+
+        StagingAppendStereoLE(gRecordRing[r * 2L + 0L], gRecordRing[r * 2L + 1L]);
+        gRecordRingRead++;
+        if (gRecordRingRead >= kRecordRingFrames) gRecordRingRead = 0L;
+        drained++;
+    }
+
+    if (gRecordStagingCount > 0L) {
+        FlushRecordStaging();
+    }
+}
+
+static OSErr PromptRecordOutputFile(FSSpec *spec)
+{
+    Str255 defaultName;
+    OSErr err = noErr;
+
+    if (spec == NULL) return paramErr;
+    if (!gSample.loaded || gSample.sampleRate == 0) return paramErr;
+
+    BaseNameFromFilename(gLoadedSpec.name, defaultName);
+    if (defaultName[0] == 0) CopyPString("\pGranular", defaultName);
+    if (defaultName[0] > 0 && defaultName[0] < 251) {
+        short len = (short)defaultName[0];
+        defaultName[len + 1] = '-';
+        defaultName[len + 2] = 'r';
+        defaultName[len + 3] = 'e';
+        defaultName[len + 4] = 'c';
+        defaultName[0] = (unsigned char)(len + 4);
+    }
+    SetFilenameExtension(defaultName, "\p.wav");
+
+    gSuppressAudioOutput = true;
+    PumpEvents();
+
+    if (!ChooseRecordFile(defaultName, spec)) {
+        err = userCanceledErr;
+    }
+
+    gSuppressAudioOutput = false;
+    PumpEvents();
+    return err;
+}
+
+static OSErr CommitRecordingToFile(const FSSpec *spec)
+{
+    unsigned char hdr[kWAVHeaderBytes];
+    OSErr err;
+    long headerBytes;
+
+    if (spec == NULL) return paramErr;
+    if (!gSample.loaded || gSample.sampleRate == 0) return paramErr;
+
+    err = FSpDelete(spec);
+    if (err != noErr && err != fnfErr) return err;
+
+    err = FSpCreate(spec, 0, 'WAVE', smSystemScript);
+    if (err != noErr) return err;
+
+    err = FSpOpenDF(spec, fsWrPerm, &gRecordRefNum);
+    if (err != noErr) return err;
+
+    gRecordBytesWritten = 0UL;
+    gRecordPhase = 0UL;
+    gRecordPrevL = 0;
+    gRecordPrevR = 0;
+    gRecordStagingCount = 0L;
+    ResetRecordRing();
+
+    if (gRecordRing == NULL) {
+        gRecordRing = (short *)NewPtrClear(kRecordRingFrames * 2L * (Size)sizeof(short));
+        if (gRecordRing == NULL) {
+            FSClose(gRecordRefNum);
+            gRecordRefNum = 0;
+            return memFullErr;
+        }
+    }
+
+    BuildPCM44WAVHeader(hdr, 0UL);
+    headerBytes = kWAVHeaderBytes;
+    err = FSWrite(gRecordRefNum, &headerBytes, hdr);
+    if (err != noErr) {
+        FSClose(gRecordRefNum);
+        gRecordRefNum = 0;
+        return err;
+    }
+
+    gRecording = true;
+    SetActivity("\pRecording...");
+    return noErr;
+}
+
+static OSErr FinishRecording(void)
+{
+    unsigned char hdr[kWAVHeaderBytes];
+    OSErr err;
+    long headerBytes;
+    long fileSize;
+
+    if (gRecordStartPending) {
+        gRecordStartPending = false;
+        SetActivity("\p");
+        return noErr;
+    }
+
+    if (!gRecording) return noErr;
+
+    gRecording = false;
+    DrainRecordRingToDisk();
+    FlushRecordStaging();
+
+    if (gRecordRefNum == 0) {
+        return noErr;
+    }
+
+    BuildPCM44WAVHeader(hdr, gRecordBytesWritten);
+    headerBytes = kWAVHeaderBytes;
+    err = SetFPos(gRecordRefNum, fsFromStart, 0L);
+    if (err == noErr) {
+        err = FSWrite(gRecordRefNum, &headerBytes, hdr);
+    }
+    if (err == noErr) {
+        fileSize = kWAVHeaderBytes + (long)gRecordBytesWritten;
+        err = FSSetForkSize(gRecordRefNum, fsFromStart, fileSize);
+    }
+    FSClose(gRecordRefNum);
+    gRecordRefNum = 0;
+
+    if (err == noErr) {
+        SetActivity("\pRecording saved");
+    }
+    return err;
+}
+
+static void StopRecordingSilently(void)
+{
+    gRecordStartPending = false;
+
+    if (!gRecording && gRecordRefNum == 0) return;
+
+    gRecording = false;
+    DrainRecordRingToDisk();
+    FlushRecordStaging();
+    if (gRecordRefNum != 0) {
+        FSClose(gRecordRefNum);
+        gRecordRefNum = 0;
+    }
+    ResetRecordRing();
+    gRecordBytesWritten = 0UL;
+    gRecordPhase = 0UL;
+    gRecordStagingCount = 0L;
+}
+
+static void RecordEngineStereoFrame(short left, short right)
+{
+    unsigned long sampleRate;
+
+    if (!gRecording || gRecordRefNum == 0) return;
+    if (!gSample.loaded || gSample.sampleRate == 0) return;
+
+    sampleRate = gSample.sampleRate;
+    gRecordPhase += sampleRate;
+    {
+        short pushes = 0;
+        while (gRecordPhase >= kRecordSampleRate && pushes < kRecordMaxPushesPerFrame) {
+            gRecordPhase -= kRecordSampleRate;
+            RecordRingPushStereo(left, right);
+            pushes++;
+        }
+    }
+    gRecordPrevL = left;
+    gRecordPrevR = right;
+}
+
+static void DrawRecordButton(void)
+{
+    Str255 label;
+    short labelWidth;
+    short x;
+    short y;
+
+    if (gRecordButton == NULL || gWindow == NULL) return;
+
+    Draw1Control(gRecordButton);
+
+    if (gRecording || gRecordStartPending) {
+        CopyPString("\pStop", label);
+    } else {
+        CopyPString("\pRecord", label);
+    }
+
+    TextFace(bold);
+    labelWidth = StringWidthP(label);
+    x = (short)(gRecordRect.left + ((gRecordRect.right - gRecordRect.left) - labelWidth) / 2);
+    y = (short)(gRecordRect.top + ((gRecordRect.bottom - gRecordRect.top + 10) / 2) - 2);
+    MoveTo(x, y);
+    DrawString(label);
+    TextFace(0);
+}
+
+static void UpdateRecordButton(void)
+{
+    if (gWindow == NULL) return;
+    SetPort(gWindow);
+    InvalRect(&gRecordRect);
+}
+
+static void ToggleRecord(void)
+{
+    OSErr err;
+
+    if (gRecording) {
+        err = FinishRecording();
+        UpdateRecordButton();
+        if (err != noErr) {
+            SetActivityError("\pRecord error ", err);
+            SysBeep(10);
+        }
+        return;
+    }
+
+    if (gRecordStartPending) {
+        gRecordStartPending = false;
+        SetActivity("\p");
+        UpdateRecordButton();
+        return;
+    }
+
+    if (!gSample.loaded) {
+        SetActivity("\pLoad a WAV first");
+        SysBeep(10);
+        return;
+    }
+
+    err = PromptRecordOutputFile(&gRecordPendingSpec);
+    if (err == userCanceledErr) return;
+    if (err != noErr) {
+        SetActivityError("\pRecord error ", err);
+        SysBeep(10);
+        return;
+    }
+
+    gRecordStartPending = true;
+    SetActivity("\pPreparing record...");
+    UpdateRecordButton();
+    PumpEvents();
+}
+
+static long ReadLE32Signed(const unsigned char *p)
+{
+    return (long)ReadLE32(p);
+}
+
+static OSErr WriteEntireFile(const FSSpec *spec, Ptr data, long size)
+{
+    OSErr err;
+    short refNum;
+    long bytesToWrite;
+
+    if (spec == NULL || data == NULL || size <= 0L) return paramErr;
+
+    err = FSpDelete(spec);
+    if (err != noErr && err != fnfErr) return err;
+
+    err = FSpCreate(spec, 'GRN ', 'gran', smSystemScript);
+    if (err != noErr) return err;
+
+    err = FSpOpenDF(spec, fsWrPerm, &refNum);
+    if (err != noErr) return err;
+
+    bytesToWrite = size;
+    err = FSWrite(refNum, &bytesToWrite, data);
+    FSClose(refNum);
+    return err;
+}
+
+static OSErr CopyFileSpec(const FSSpec *src, const FSSpec *dst)
+{
+    Ptr data = NULL;
+    long size = 0;
+    OSErr err;
+
+    err = LoadEntireFile(src, &data, &size);
+    if (err != noErr) return err;
+    err = WriteEntireFile(dst, data, size);
+    DisposePtr(data);
+    return err;
+}
+
+static void StripFilenameExtension(Str255 name)
+{
+    short i;
+    short len;
+
+    if (name[0] == 0) return;
+    len = (short)name[0];
+    for (i = len; i >= 2; i--) {
+        if (name[i] == '.') {
+            name[0] = (unsigned char)(i - 1);
+            return;
+        }
+    }
+}
+
+static void SetFilenameExtension(Str255 name, ConstStr255Param ext)
+{
+    StripFilenameExtension(name);
+    AppendPString(name, ext);
+}
+
+static void BaseNameFromFilename(ConstStr255Param src, Str255 outBase)
+{
+    Str255 temp;
+    short i;
+    short len;
+    short lastColon = 0;
+
+    CopyPString(src, temp);
+    StripFilenameExtension(temp);
+    len = temp[0];
+    for (i = 1; i <= len; i++) {
+        if (temp[i] == ':') lastColon = i;
+    }
+    if (lastColon > 0 && lastColon < len) {
+        CopyPString("\p", outBase);
+        AppendPString(outBase, temp + lastColon);
+    } else {
+        CopyPString(temp, outBase);
+    }
+}
+
+static OSErr BuildSiblingFileSpec(const FSSpec *sibling, ConstStr255Param fileName, FSSpec *outSpec)
+{
+    if (sibling == NULL || fileName == NULL || outSpec == NULL) return paramErr;
+    *outSpec = *sibling;
+    CopyPString(fileName, outSpec->name);
+    return noErr;
+}
+
+static OSErr WritePatchBuffer(unsigned char *buf, long *outSize, ConstStr255Param wavFileName)
+{
+    long offset = 0;
+    short i;
+    short nameLen;
+
+    if (buf == NULL || outSize == NULL || wavFileName == NULL) return paramErr;
+
+    WriteLE32(buf + offset, (unsigned long)kGranPatchMagic); offset += 4;
+    WriteLE32(buf + offset, (unsigned long)kGranPatchVersion); offset += 4;
+
+    WriteLE32(buf + offset, (unsigned long)gLoopStartNorm); offset += 4;
+    WriteLE32(buf + offset, (unsigned long)gLoopEndNorm); offset += 4;
+    WriteLE32(buf + offset, (unsigned long)gGrainSizeNorm); offset += 4;
+    WriteLE32(buf + offset, (unsigned long)gGrainRateNorm); offset += 4;
+    WriteLE32(buf + offset, (unsigned long)gGainNorm); offset += 4;
+    WriteLE32(buf + offset, (unsigned long)gPitchNorm); offset += 4;
+    WriteLE32(buf + offset, (unsigned long)gFineTuneNorm); offset += 4;
+    WriteLE32(buf + offset, (unsigned long)gPresetFadeNorm); offset += 4;
+    WriteLE32(buf + offset, (unsigned long)gPlayFadeNorm); offset += 4;
+    WriteLE32(buf + offset, (unsigned long)gPitchGlideNorm); offset += 4;
+    WriteLE32(buf + offset, gPresetFadeVolumeMode ? 1UL : 0UL); offset += 4;
+
+    for (i = 0; i < kPresetCount; i++) {
+        buf[offset++] = gPresets[i].assigned ? 1 : 0;
+        WriteLE32(buf + offset, (unsigned long)gPresets[i].startNorm); offset += 4;
+        WriteLE32(buf + offset, (unsigned long)gPresets[i].endNorm); offset += 4;
+    }
+
+    nameLen = wavFileName[0];
+    if (nameLen > kGranPatchWavNameMax) nameLen = kGranPatchWavNameMax;
+    buf[offset++] = (unsigned char)nameLen;
+    if (nameLen > 0) {
+        BlockMoveData(wavFileName + 1, buf + offset, nameLen);
+        offset += nameLen;
+    }
+
+    *outSize = offset;
+    return noErr;
+}
+
+static OSErr ReadPatchBuffer(const unsigned char *buf, long size, Str255 outWavFileName)
+{
+    long offset = 0;
+    long magic;
+    long version;
+    short i;
+    short nameLen;
+
+    if (buf == NULL || size < 64L || outWavFileName == NULL) return paramErr;
+
+    magic = ReadLE32Signed(buf + offset); offset += 4;
+    version = ReadLE32Signed(buf + offset); offset += 4;
+    if (magic != kGranPatchMagic || version != kGranPatchVersion) return paramErr;
+
+    gLoopStartNorm = ReadLE32Signed(buf + offset); offset += 4;
+    gLoopEndNorm = ReadLE32Signed(buf + offset); offset += 4;
+    gGrainSizeNorm = ReadLE32Signed(buf + offset); offset += 4;
+    gGrainRateNorm = ReadLE32Signed(buf + offset); offset += 4;
+    gGainNorm = ReadLE32Signed(buf + offset); offset += 4;
+    gPitchNorm = ReadLE32Signed(buf + offset); offset += 4;
+    gFineTuneNorm = ReadLE32Signed(buf + offset); offset += 4;
+    gPresetFadeNorm = ReadLE32Signed(buf + offset); offset += 4;
+    gPlayFadeNorm = ReadLE32Signed(buf + offset); offset += 4;
+    gPitchGlideNorm = ReadLE32Signed(buf + offset); offset += 4;
+    gPresetFadeVolumeMode = (ReadLE32Signed(buf + offset) != 0L); offset += 4;
+
+    for (i = 0; i < kPresetCount; i++) {
+        gPresets[i].assigned = (buf[offset++] != 0);
+        gPresets[i].startNorm = ReadLE32Signed(buf + offset); offset += 4;
+        gPresets[i].endNorm = ReadLE32Signed(buf + offset); offset += 4;
+    }
+
+    if (offset >= size) return paramErr;
+    nameLen = (short)buf[offset++];
+    if (nameLen < 0 || nameLen > kGranPatchWavNameMax) return paramErr;
+    if (offset + nameLen > size) return paramErr;
+
+    CopyPString("\p", outWavFileName);
+    if (nameLen > 0) {
+        BlockMoveData(buf + offset, outWavFileName + 1, nameLen);
+        outWavFileName[0] = (unsigned char)nameLen;
+        offset += nameLen;
+    }
+
+    return noErr;
+}
+
+static OSErr SaveGranPatch(const FSSpec *patchSpec)
+{
+    Str255 baseName;
+    Str255 wavName;
+    FSSpec wavSpec;
+    unsigned char patchBuf[512];
+    long patchSize = 0;
+    OSErr err;
+
+    if (!gSample.loaded || !gHasLoadedFile) return paramErr;
+    if (patchSpec == NULL) return paramErr;
+
+    BaseNameFromFilename(patchSpec->name, baseName);
+    if (baseName[0] == 0) CopyPString("\pGranular", baseName);
+
+    CopyPString(baseName, wavName);
+    SetFilenameExtension(wavName, "\p.wav");
+
+    err = BuildSiblingFileSpec(patchSpec, wavName, &wavSpec);
+    if (err != noErr) return err;
+
+    err = CopyFileSpec(&gLoadedSpec, &wavSpec);
+    if (err != noErr) return err;
+
+    err = WritePatchBuffer(patchBuf, &patchSize, wavName);
+    if (err != noErr) return err;
+
+    return WriteEntireFile(patchSpec, (Ptr)patchBuf, patchSize);
+}
+
+static OSErr LoadGranPatch(const FSSpec *patchSpec)
+{
+    Ptr patchData = NULL;
+    long patchSize = 0;
+    Str255 wavFileName;
+    FSSpec wavSpec;
+    OSErr err;
+
+    if (patchSpec == NULL) return paramErr;
+
+    err = LoadEntireFile(patchSpec, &patchData, &patchSize);
+    if (err != noErr) return err;
+
+    err = ReadPatchBuffer((const unsigned char *)patchData, patchSize, wavFileName);
+    DisposePtr(patchData);
+    if (err != noErr) return err;
+
+    err = BuildSiblingFileSpec(patchSpec, wavFileName, &wavSpec);
+    if (err != noErr) return err;
+
+    StopRecordingSilently();
+    UpdateRecordButton();
+
+    if (gTransportPlaying || gEnginePlaying) {
+        RequestStopPlay();
+    }
+    CancelPresetTransition();
+    gWaitingForPresetKey = false;
+
+    gPendingLoadSpec = wavSpec;
+    gPendingPatchApply = true;
+    gLoadPending = true;
+    ClearWaveform();
+    SetActivity("\pLoading patch...");
+    return noErr;
+}
+
+static void ApplyPatchSettingsToUI(void)
+{
+    CancelPresetTransition();
+    gWaitingForPresetKey = false;
+
+    if (gStartControl != NULL) SetControlValue(gStartControl, (short)gLoopStartNorm);
+    if (gEndControl != NULL) SetControlValue(gEndControl, (short)gLoopEndNorm);
+    if (gShiftControl != NULL) SetControlValue(gShiftControl, (short)gLoopStartNorm);
+    if (gGrainSizeControl != NULL) SetControlValue(gGrainSizeControl, (short)gGrainSizeNorm);
+    if (gGrainRateControl != NULL) SetControlValue(gGrainRateControl, (short)gGrainRateNorm);
+    if (gGainControl != NULL) SetControlValue(gGainControl, (short)gGainNorm);
+    if (gPitchControl != NULL) SetControlValue(gPitchControl, (short)gPitchNorm);
+    if (gFineTuneControl != NULL) SetControlValue(gFineTuneControl, (short)gFineTuneNorm);
+    if (gPresetFadeControl != NULL) SetControlValue(gPresetFadeControl, (short)gPresetFadeNorm);
+    if (gPlayFadeControl != NULL) SetControlValue(gPlayFadeControl, (short)gPlayFadeNorm);
+    if (gPitchGlideControl != NULL) SetControlValue(gPitchGlideControl, (short)gPitchGlideNorm);
+    if (gFadeModeButton != NULL) {
+        SetControlValue(gFadeModeButton, gPresetFadeVolumeMode ? 1 : 0);
+    }
+
+    ApplyPlayFadeNorm();
+    ApplyPitchGlideNorm();
+    ApplyLoopFramesFromControls(true);
+    ApplyGrainControls();
+    RequestFullRedraw();
+}
+
+static Boolean ChooseSavePatchFile(Str255 defaultName, FSSpec *spec)
+{
+    StandardFileReply reply;
+
+    if (spec == NULL) return false;
+    StandardPutFile("\pSave patch as:", defaultName, &reply);
+    if (!reply.sfGood) return false;
+    *spec = reply.sfFile;
+    return true;
+}
+
+static Boolean ChooseOpenPatchFile(FSSpec *spec)
+{
+    StandardFileReply reply;
+
+    if (spec == NULL) return false;
+    StandardGetFile(NULL, 0, NULL, &reply);
+    if (!reply.sfGood) return false;
+    *spec = reply.sfFile;
+    return true;
+}
+
+static void SavePatchAction(void)
+{
+    Str255 defaultName;
+    FSSpec patchSpec;
+    OSErr err;
+
+    if (!gSample.loaded || !gHasLoadedFile) {
+        SetActivity("\pLoad a WAV first");
+        SysBeep(10);
+        return;
+    }
+
+    BaseNameFromFilename(gLoadedSpec.name, defaultName);
+    if (defaultName[0] == 0) CopyPString("\pGranular", defaultName);
+    SetFilenameExtension(defaultName, "\p.gran");
+
+    if (!ChooseSavePatchFile(defaultName, &patchSpec)) return;
+
+    SetActivity("\pSaving patch...");
+    PumpEvents();
+
+    err = SaveGranPatch(&patchSpec);
+    if (err != noErr) {
+        SetActivityError("\pSave error ", err);
+        SysBeep(10);
+        return;
+    }
+
+    SetActivity("\pPatch saved");
+    PumpEvents();
+}
+
+static void OpenPatchAction(void)
+{
+    FSSpec patchSpec;
+    OSErr err;
+
+    if (!ChooseOpenPatchFile(&patchSpec)) return;
+    err = LoadGranPatch(&patchSpec);
+    if (err != noErr) {
+        SetActivityError("\pOpen error ", err);
+        SysBeep(10);
+    }
+}
+
 static long WAVChunkPayloadBytes(long pos, unsigned long chunkSize, long fileSize)
 {
     long avail = fileSize - (pos + 8);
@@ -914,6 +1703,7 @@ static void MoveLoopWindowTo(long newStartNorm)
 
 static void RequestFullRedraw(void)
 {
+    gWaveOnlyUpdateHint = false;
     if (gInSliderTrack) {
         gNeedsFullRedraw = true;
     } else if (gWindow != NULL) {
@@ -924,6 +1714,7 @@ static void RequestFullRedraw(void)
 
 static void RequestWaveRedraw(void)
 {
+    gWaveOnlyUpdateHint = true;
     if (gWindow != NULL) {
         SetPort(gWindow);
         InvalRect(&gWaveRect);
@@ -1246,6 +2037,16 @@ static void StopAudioEngineImmediate(void)
         cmd.cmd = flushCmd;
         SndDoImmediate(gChannel, &cmd);
     }
+
+    if (gPresetTransitionActive || gPresetTransCommitPending) {
+        CancelPresetTransition();
+        ApplyLoopFramesFromControls(false);
+        if (gWaveformReady && gWindow != NULL) {
+            SetPort(gWindow);
+            WaveformRepaintNow();
+        }
+    }
+
     UpdatePlayStopButton();
 }
 
@@ -1442,7 +2243,13 @@ static void EndPresetTransition(void)
 
     CancelPresetTransition();
     gWaveMarkCacheValid = false;
-    gWaveOverlayDirty = true;
+    if (gWaveformReady && gWindow != NULL) {
+        SetPort(gWindow);
+        WaveformRepaintNow();
+        RequestWaveRedraw();
+    } else {
+        gWaveOverlayDirty = true;
+    }
 
     if (gPresetFadeVolumeMode) {
         for (g = 0; g < kMaxGrains; g++) {
@@ -1501,7 +2308,7 @@ static void StartPresetTransition(long toStartNorm, long toEndNorm)
     fadeFrames = (fadeMS * (long)gSample.sampleRate) / 1000L;
     if (fadeFrames < 1L) fadeFrames = 1L;
 
-    ApplyLoopFramesFromControls(!retargeting);
+    ApplyLoopFramesFromControls(false);
 
     gCommitOldStart = oldStart;
     gCommitOldEnd = oldEnd;
@@ -1548,10 +2355,13 @@ static void StartPresetTransition(long toStartNorm, long toEndNorm)
     }
 
     gWaveOverlayLastStep = -1;
-    gWaveMarkCacheValid = false;
+    if (!retargeting) {
+        gWaveMarkCacheValid = false;
+    }
     if (gWaveformReady && gSample.loaded && gWindow != NULL) {
         SetPort(gWindow);
-        DrawWaveformTransitionFull();
+        WaveformRepaintNow();
+        RequestWaveRedraw();
     } else {
         gWaveOverlayDirty = true;
     }
@@ -2007,6 +2817,7 @@ static void FillOutputFrames(short *dst, long frameCount)
 
         dst[i * 2L + 0] = (short)mixL;
         dst[i * 2L + 1] = (short)mixR;
+        RecordEngineStereoFrame((short)mixL, (short)mixR);
 
         if (gOldGrainTailFramesLeft > 0L) {
             gOldGrainTailFramesLeft--;
@@ -2036,12 +2847,15 @@ static void FillDoubleBuffer(SndDoubleBufferPtr dbuf)
 static pascal void GranularDoubleBackProc(SndChannelPtr chan, SndDoubleBufferPtr doubleBuffer)
 {
     (void)chan;
-    if (!gEngineRunning || !gEnginePlaying) {
+    if (!gEngineRunning || !gEnginePlaying || gSuppressAudioOutput) {
         if (doubleBuffer != NULL) {
             long i;
             short *dst = (short *)doubleBuffer->dbSoundData;
             for (i = 0; i < doubleBuffer->dbNumFrames * 2L; i++) dst[i] = 0;
-            doubleBuffer->dbFlags = dbLastBuffer | dbBufferReady;
+            doubleBuffer->dbFlags = dbBufferReady;
+            if (!gEngineRunning || !gEnginePlaying) {
+                doubleBuffer->dbFlags |= dbLastBuffer;
+            }
         }
         return;
     }
@@ -2068,6 +2882,16 @@ static OSErr InitAudioEngine(void)
         return err;
     }
 
+    if (gRecordRing == NULL) {
+        gRecordRing = (short *)NewPtrClear(kRecordRingFrames * 2L * (Size)sizeof(short));
+        if (gRecordRing == NULL) {
+            DisposeDoubleBuffers();
+            SndDisposeChannel(gChannel, true);
+            gChannel = NULL;
+            return memFullErr;
+        }
+    }
+
     gEngineRunning = true;
     gEnginePlaying = false;
     gPlayFadeGain256 = 0L;
@@ -2089,6 +2913,7 @@ static void DisposeAudioEngine(void)
         gDoubleBackUPP = NULL;
     }
 
+    FreeRecordRing();
     gEngineRunning = false;
 }
 
@@ -2168,16 +2993,22 @@ static void CreateMainWindow(void)
     gWindow = NewWindow(NULL, &r, "\pGranular Engine V2h", true, documentProc, (WindowPtr)-1L, true, 0);
 
     SetRect(&gLoadRect, kLoadLeft, kLoadTop, kLoadLeft + kLoadWidth, kLoadTop + kLoadHeight);
+    SetRect(&gSavePatchRect, kSavePatchLeft, kSavePatchTop, kSavePatchLeft + kSavePatchWidth, kSavePatchTop + kSavePatchHeight);
+    SetRect(&gOpenPatchRect, kOpenPatchLeft, kOpenPatchTop, kOpenPatchLeft + kOpenPatchWidth, kOpenPatchTop + kOpenPatchHeight);
     SetRect(&gPlayRect, kPlayLeft, kPlayTop, kPlayLeft + kPlayWidth, kPlayTop + kPlayHeight);
     SetRect(&gResetPitchRect, kResetPitchLeft, kResetPitchTop, kResetPitchLeft + kResetPitchWidth, kResetPitchTop + kResetPitchHeight);
     SetRect(&gAssignRect, kAssignLeft, kAssignTop, kAssignLeft + kAssignWidth, kAssignTop + kAssignHeight);
+    SetRect(&gRecordRect, kRecordLeft, kRecordTop, kRecordLeft + kRecordWidth, kRecordTop + kRecordHeight);
     SetRect(&gQuitRect, kQuitLeft, kQuitTop, kQuitLeft + kQuitWidth, kQuitTop + kQuitHeight);
     SetRect(&gWaveRect, kWaveLeft, kWaveTop, kWaveLeft + kWaveWidth, kWaveTop + kWaveHeight);
 
     gLoadButton = NewControl(gWindow, &gLoadRect, "\pLoad WAV", true, 0, 0, 1, pushButProc, 0L);
+    gSavePatchButton = NewControl(gWindow, &gSavePatchRect, "\pSave Patch", true, 0, 0, 1, pushButProc, 0L);
+    gOpenPatchButton = NewControl(gWindow, &gOpenPatchRect, "\pOpen Patch", true, 0, 0, 1, pushButProc, 0L);
     gPlayButton = NewControl(gWindow, &gPlayRect, "\p", true, 0, 0, 1, pushButProc, 0L);
     gResetPitchButton = NewControl(gWindow, &gResetPitchRect, "\pReset Pitch", true, 0, 0, 1, pushButProc, 0L);
     gAssignButton = NewControl(gWindow, &gAssignRect, "\pAssign", true, 0, 0, 1, pushButProc, 0L);
+    gRecordButton = NewControl(gWindow, &gRecordRect, "\p", true, 0, 0, 1, pushButProc, 0L);
     gQuitButton = NewControl(gWindow, &gQuitRect, "\pQuit", true, 0, 0, 1, pushButProc, 0L);
 
     if (gSliderActionUPP == NULL) {
@@ -2203,6 +3034,12 @@ static void CreateMainWindow(void)
 static void ClearWaveform(void)
 {
     short i;
+
+    if (gRecording) {
+        StopRecordingSilently();
+        UpdateRecordButton();
+    }
+
     for (i = 0; i < kWavePoints; i++) {
         gWaveMin[i] = 0;
         gWaveMax[i] = 0;
@@ -2303,8 +3140,7 @@ static void AdvanceWaveformBuild(short maxPoints)
         gWaveStatusPaneDrawn = false;
         SetActivity("\p");
         if (gWindow != NULL) {
-            SetPort(gWindow);
-            InvalRect(&gWaveRect);
+            RequestWaveRedraw();
         }
     }
 }
@@ -2341,9 +3177,14 @@ static void PerformPendingLoad(void)
     gLoadedSpec = gPendingLoadSpec;
     gHasLoadedFile = true;
     SetLoadedName(gPendingLoadSpec.name);
-    SetDefaultLoopWindowAfterLoad();
-    ApplyLoopFramesFromControls(true);
-    ApplyGrainControls();
+    if (gPendingPatchApply) {
+        gPendingPatchApply = false;
+        ApplyPatchSettingsToUI();
+    } else {
+        SetDefaultLoopWindowAfterLoad();
+        ApplyLoopFramesFromControls(true);
+        ApplyGrainControls();
+    }
     if (gEngineRunning && gChannel != NULL) {
         BuildDoubleBufferHeader();
     }
@@ -2357,18 +3198,36 @@ static void ProcessBackgroundTasks(void)
         gLoadPending = false;
         PerformPendingLoad();
     }
+    if (gRecordStartPending) {
+        OSErr recErr;
+
+        gRecordStartPending = false;
+        recErr = CommitRecordingToFile(&gRecordPendingSpec);
+        if (recErr != noErr) {
+            StopRecordingSilently();
+            SetActivityError("\pRecord error ", recErr);
+            SysBeep(10);
+        } else {
+            gRecording = true;
+            SetActivity("\pRecording...");
+        }
+        UpdateRecordButton();
+    }
+    if (gRecording) {
+        DrainRecordRingToDisk();
+        if (gRecordRingOverflow && !gRecordOverflowReported) {
+            gRecordOverflowReported = true;
+            SetActivity("\pRecord buffer full");
+        }
+    }
     if (gWaveBuildActive) {
         AdvanceWaveformBuild(6);
     }
     if (gWaveOverlayDirty) {
         gWaveOverlayDirty = false;
-        if (gPresetTransitionActive && gWaveformReady && gWindow != NULL) {
+        if (gWaveformReady && gWindow != NULL) {
             SetPort(gWindow);
-            if (!gWaveMarkCacheValid) {
-                DrawWaveformTransitionFull();
-            } else {
-                RefreshWaveformMarkers();
-            }
+            WaveformRepaintNow();
         } else {
             RequestWaveRedraw();
         }
@@ -2507,7 +3366,9 @@ static void DrawWaveformTransitionFull(void)
     w = r.right - r.left - 2;
     mid = (r.top + r.bottom) / 2;
 
-    EraseRect(&r);
+    if (!gWaveMarkCacheValid) {
+        EraseRect(&r);
+    }
     FrameRect(&r);
     DrawWaveformPaneBackground(&r);
     DrawWaveformBody(&r, w, mid);
@@ -2607,6 +3468,32 @@ static void DrawLoopWindowMarkers(const Rect *r, int w, long startFrame, long en
     RGBForeColor(&savedFore);
 }
 
+static Boolean WaveformShowsTransitionMarkers(void)
+{
+    return gSample.loaded && (gPresetTransitionActive || gPresetTransCommitPending);
+}
+
+static void WaveformRepaintNow(void)
+{
+    if (gWindow == NULL) return;
+
+    SetPort(gWindow);
+    if (!gWaveformReady || !gSample.loaded) {
+        DrawWaveformStatusOnly();
+        return;
+    }
+
+    if (WaveformShowsTransitionMarkers()) {
+        if (gWaveMarkCacheValid) {
+            RefreshWaveformMarkers();
+        } else {
+            DrawWaveformTransitionFull();
+        }
+    } else {
+        DrawWaveform();
+    }
+}
+
 static void DrawWaveform(void)
 {
     Rect r = gWaveRect;
@@ -2624,7 +3511,7 @@ static void DrawWaveform(void)
 
     SetPort(gWindow);
 
-    if (gPresetTransitionActive && gSample.loaded) {
+    if (WaveformShowsTransitionMarkers()) {
         if (!gWaveMarkCacheValid) {
             DrawWaveformTransitionFull();
         } else {
@@ -3037,14 +3924,14 @@ static void DrawMainWindow(void)
     DrawString(gLoadedName);
 
     Draw1Control(gLoadButton);
+    Draw1Control(gSavePatchButton);
+    Draw1Control(gOpenPatchButton);
     DrawPlayStopButton();
     Draw1Control(gResetPitchButton);
     Draw1Control(gAssignButton);
+    DrawRecordButton();
     Draw1Control(gQuitButton);
 
-    if (gPresetTransitionActive && gWaveformReady && gSample.loaded) {
-        gWaveMarkCacheValid = false;
-    }
     DrawWaveform();
 
     DrawSliderLabels();
@@ -3075,11 +3962,18 @@ static void HandleControlHit(ControlHandle control)
         FSSpec spec;
 
         if (ChooseWAVFile(&spec)) {
+            gPendingPatchApply = false;
             gPendingLoadSpec = spec;
             gLoadPending = true;
             ClearWaveform();
             SetActivity("\pLoading...");
         }
+        return;
+    } else if (control == gSavePatchButton) {
+        SavePatchAction();
+        return;
+    } else if (control == gOpenPatchButton) {
+        OpenPatchAction();
         return;
     } else if (control == gPlayButton) {
         TogglePlayStop();
@@ -3089,6 +3983,9 @@ static void HandleControlHit(ControlHandle control)
         return;
     } else if (control == gAssignButton) {
         BeginAssignPresetMode();
+        return;
+    } else if (control == gRecordButton) {
+        ToggleRecord();
         return;
     } else if (control == gFadeModeButton) {
         return;
@@ -3198,13 +4095,20 @@ static void HandleKeyDown(EventRecord *event)
 
 static void HandleUpdate(EventRecord *event)
 {
-    BeginUpdate((WindowPtr)event->message);
-    if (!gWaveformReady) {
-        DrawWaveformStatusOnly();
-    } else {
-        DrawMainWindow();
+    WindowPtr win = (WindowPtr)event->message;
+
+    BeginUpdate(win);
+    if (win == gWindow) {
+        if (!gWaveformReady) {
+            DrawWaveformStatusOnly();
+        } else if (gWaveOnlyUpdateHint) {
+            gWaveOnlyUpdateHint = false;
+            WaveformRepaintNow();
+        } else {
+            DrawMainWindow();
+        }
     }
-    EndUpdate((WindowPtr)event->message);
+    EndUpdate(win);
 }
 
 static void EventLoop(void)
@@ -3232,6 +4136,7 @@ int main(void)
         SetActivityError("\pAudio init error ", err);
     }
     EventLoop();
+    StopRecordingSilently();
     DisposeAudioEngine();
     if (gSliderActionUPP != NULL) {
         DisposeControlActionUPP(gSliderActionUPP);
