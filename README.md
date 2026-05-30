@@ -2,6 +2,13 @@
 
 Experimental music and utility applications for **Macintosh G3 (PowerPC)** running **Mac OS 9**. Sources are written in C for **Metrowerks CodeWarrior** as self-contained, single-file programs (add one `.c` file per target—no external dependencies beyond the classic Mac OS SDK).
 
+## Why
+
+Modern music software often assumes modern hardware and workflows.
+This project explores what is possible on vintage PowerPC Macintosh systems by building purpose-built composition and performance tools tailored to my own workflow.
+
+Several applications from this project have already been used during public live performances.
+
 ## Target platform
 
 - **Hardware:** Power Macintosh G3 (and similar PowerPC Macs)
