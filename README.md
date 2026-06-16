@@ -2,7 +2,7 @@
 
 Experimental music and utility applications for **Macintosh G3 (PowerPC)** running **Mac OS 9**. Sources are written in C for **Metrowerks CodeWarrior** as self-contained, single-file programs (add one `.c` file per target—no external dependencies beyond the classic Mac OS SDK).
 
-[Download example.flac](example.flac)
+[example.flac](example.flac)
 
 ## Why
 
