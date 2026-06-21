@@ -846,7 +846,7 @@ void g3_player_pause(G3Player* player, int deck_index) {
     }
     if (deck->freeze.buffer != NULL) g3_freeze_release_deck(deck_index, &deck->freeze);
     deck->speed_target = 0.0;
-    deck->speed_current = 0.0;
+    if (deck->ramp_seconds <= 0.0001f) deck->speed_current = 0.0;
     deck->state = G3_TRANSPORT_PAUSED;
 }
 
