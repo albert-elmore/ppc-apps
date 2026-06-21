@@ -40,16 +40,21 @@
 #define G3_DECK_COUNT 3
 #define G3_SAMPLE_RATE 44100
 #define G3_FRAMES_PER_BUFFER 1024
+#define G3_STREAM_RING_SECONDS 3
+#define G3_STREAM_RING_FRAMES ((unsigned long)G3_SAMPLE_RATE * (unsigned long)G3_STREAM_RING_SECONDS)
+#define G3_STREAM_PREFETCH_FRAMES ((unsigned long)G3_SAMPLE_RATE * 2UL)
 
 /* ---------- freeze / granular (tweak and rebuild) ---------- */
 #define G3_FREEZE_WINDOW_MS           1000
 #define G3_GRAIN_DURATION_MS          200
 #define G3_GRAIN_SPAWN_INTERVAL_MS    10  /* higher = less CPU in audio callback */
-#define G3_GRAIN_FADE_MS              20  /* fade in/out; capped to half grain length */
+#define G3_GRAIN_FADE_MS              40  /* Hann fade in/out; capped to half grain length */
 #define G3_FREEZE_MAX_GRAINS          25
 #define G3_FREEZE_OUTPUT_GAIN         0.60f /* per-grain level before fixed headroom scale */
 #define G3_FREEZE_MIX_HEADROOM        0.32f /* ~1/sqrt(max grains); avoids pumping pops */
 #define G3_FREEZE_CROSSFADE_MS        40   /* fade between play and freeze on toggle */
+#define G3_FREEZE_MIN_PLAYBACK_SPEED  0.08 /* grains need min speed; extreme pitch down must not stall CPU */
+#define G3_GRAIN_MAX_WALL_SAMPLES     (G3_SAMPLE_RATE * 3) /* max output samples per grain regardless of pitch */
 
 typedef enum G3FreezeXfadeDir {
     G3_FREEZE_XFADE_NONE = 0,
@@ -66,10 +71,10 @@ typedef enum G3TransportState {
 
 typedef struct G3Grain {
     int active;
-    unsigned long start_frame_l;
-    unsigned long start_frame_r;
-    unsigned long age;
+    unsigned long start_frame; /* same window for L/R so stereo stays coherent */
+    double age;
     unsigned long length;
+    unsigned long wall_samples; /* output samples this grain has lived (caps CPU at low pitch) */
 } G3Grain;
 
 typedef struct G3FreezeCapture {
@@ -80,6 +85,7 @@ typedef struct G3FreezeCapture {
     unsigned long fade_length_samples;
     unsigned long spawn_interval_samples;
     double spawn_accum;
+    double playback_speed;
     int xfade_dir;
     unsigned long xfade_remain;
     unsigned long xfade_total;
@@ -103,10 +109,31 @@ typedef struct G3MasterStatus {
     float peak_dbfs;
 } G3MasterStatus;
 
+typedef enum G3WavBackend {
+    G3_WAV_NONE = 0,
+    G3_WAV_MEMORY = 1,
+    G3_WAV_FILE = 2
+} G3WavBackend;
+
 typedef struct G3WavData {
-    short* samples;
+    G3WavBackend backend;
+    short refNum;
+    short scanRefNum;
+    FILE* stdio_file;
+    unsigned long data_offset;
+    unsigned long pcm_bytes;
     unsigned long frame_count;
     int channels;
+    short* samples;
+    short* ring_a;
+    short* ring_b;
+    int ring_play_a;
+    int ring_fill_pending;
+    unsigned long ring_fill_start;
+    unsigned long ring_fill_count;
+    unsigned long ring_cap;
+    unsigned long ring_start;
+    unsigned long ring_count;
 } G3WavData;
 
 typedef struct G3Deck {
@@ -150,6 +177,19 @@ void g3_player_set_master_volume(G3Player* player, float value);
 void g3_player_get_deck_status(const G3Player* player, int deck_index, G3DeckStatus* out_status);
 void g3_player_get_master_status(const G3Player* player, G3MasterStatus* out_status);
 int g3_player_render(G3Player* player, short* interleaved_stereo_out, int frame_count);
+
+/* Forward declarations — CodeWarrior requires prototypes before use. */
+static void g3_wav_close(G3WavData* wav);
+static int g3_wav_open_ring(G3WavData* wav);
+static int g3_wav_read_pcm_at(G3WavData* wav, unsigned long start_frame, unsigned long num_frames, short* dst);
+static int g3_wav_read_pcm_ring(G3WavData* wav, unsigned long start_frame, unsigned long num_frames, short* dst);
+static int g3_wav_stage_fill(G3WavData* wav, unsigned long start_frame);
+static void g3_wav_invalidate_ring(G3WavData* wav);
+static void g3_wav_ring_try_swap(G3Deck* deck);
+static void g3_wav_get_frame(const G3WavData* wav, unsigned long frame, short* out_l, short* out_r);
+static int g3_wav_ring_has_frames(const G3WavData* wav, unsigned long frame_lo, unsigned long frame_hi);
+static void g3_wav_pump_deck(G3Deck* deck);
+static short g3_fclip_to_i16(double v);
 
 static int g3_clamp_deck_index(int deck_index) {
     return deck_index >= 0 && deck_index < G3_DECK_COUNT;
@@ -213,6 +253,7 @@ static void g3_freeze_release_deck(int deck_index, G3FreezeCapture* fz) {
     fz->grain_length_samples = 0;
     fz->fade_length_samples = 0;
     fz->spawn_interval_samples = 0;
+    fz->playback_speed = 1.0;
     fz->xfade_dir = G3_FREEZE_XFADE_NONE;
     fz->xfade_remain = 0;
     fz->xfade_total = 0;
@@ -244,10 +285,54 @@ static void g3_freeze_end_capture(G3Deck* deck, int deck_index) {
 
 static int g3_spawn_grain(G3FreezeCapture* fz);
 
+static double g3_deck_pitch_speed(const G3Deck* deck) {
+    double s;
+    if (deck == NULL) return 1.0;
+    s = 1.0 + ((double)deck->pitch_percent / 100.0);
+    if (s < 0.000001) s = 0.000001;
+    return s;
+}
+
+static double g3_freeze_pitch_speed(const G3Deck* deck) {
+    double s;
+    if (deck == NULL) return 1.0;
+    s = g3_deck_pitch_speed(deck);
+    if (s < G3_FREEZE_MIN_PLAYBACK_SPEED) s = G3_FREEZE_MIN_PLAYBACK_SPEED;
+    return s;
+}
+
+static void g3_freeze_seed_grains(G3FreezeCapture* fz) {
+    int g;
+    if (fz == NULL) return;
+    fz->spawn_accum = 0.0;
+    for (g = 0; g < G3_FREEZE_MAX_GRAINS; ++g) {
+        fz->grains[g].active = 0;
+        fz->grains[g].age = 0.0;
+        fz->grains[g].length = 0;
+        fz->grains[g].wall_samples = 0;
+    }
+    for (g = 0; g < 3; ++g) {
+        if (g3_spawn_grain(fz)) {
+            unsigned long stagger = (fz->grain_length_samples * (unsigned long)g) / 3UL;
+            if (stagger >= fz->grains[g].length) stagger = fz->grains[g].length - 1;
+            fz->grains[g].age = (double)stagger;
+        }
+    }
+}
+
+static void g3_deck_resume_from_freeze(G3Deck* deck) {
+    if (deck == NULL) return;
+    deck->speed_target = g3_deck_pitch_speed(deck);
+    deck->speed_current = deck->speed_target;
+}
+
 static void g3_deck_reset(G3Deck* deck, int deck_index) {
     if (deck == NULL) return;
     g3_freeze_release_deck(deck_index, &deck->freeze);
+    g3_wav_close(&deck->wav);
     memset(deck, 0, sizeof(*deck));
+    deck->wav.refNum = -1;
+    deck->wav.scanRefNum = -1;
     deck->volume = 0.8f;
     deck->pan = 0.0f;
     deck->volume_now = 0.8f;
@@ -260,7 +345,7 @@ static void g3_deck_reset(G3Deck* deck, int deck_index) {
 void g3_player_init(G3Player* player) {
     int i;
     memset(player, 0, sizeof(*player));
-    player->master_volume = g3_db_to_linear(-4.0f);
+    player->master_volume = g3_db_to_linear(0.0f);
     for (i = 0; i < G3_DECK_COUNT; ++i) g3_deck_reset(&player->decks[i], i);
 }
 
@@ -269,8 +354,7 @@ void g3_player_shutdown(G3Player* player) {
     g3_freeze_drain_pending();
     for (i = 0; i < G3_DECK_COUNT; ++i) {
         g3_freeze_release_deck(i, &player->decks[i].freeze);
-        free(player->decks[i].wav.samples);
-        player->decks[i].wav.samples = NULL;
+        g3_wav_close(&player->decks[i].wav);
     }
 }
 
@@ -317,6 +401,243 @@ static void g3_pcm16_le_to_host(short* samples, unsigned long pcm_bytes) {
 #else
 #define g3_pcm16_le_to_host(s, n) ((void)0)
 #endif
+
+static void g3_wav_close(G3WavData* wav) {
+    if (wav == NULL) return;
+    if (wav->refNum >= 0) {
+        FSClose(wav->refNum);
+        wav->refNum = -1;
+    }
+    if (wav->scanRefNum >= 0) {
+        FSClose(wav->scanRefNum);
+        wav->scanRefNum = -1;
+    }
+    if (wav->stdio_file != NULL) {
+        fclose(wav->stdio_file);
+        wav->stdio_file = NULL;
+    }
+    free(wav->samples);
+    free(wav->ring_a);
+    free(wav->ring_b);
+    memset(wav, 0, sizeof(*wav));
+    wav->refNum = -1;
+    wav->scanRefNum = -1;
+}
+
+static int g3_wav_open_ring(G3WavData* wav) {
+    unsigned long cap;
+    unsigned long sample_count;
+    size_t bytes;
+    if (wav == NULL) return 0;
+    cap = G3_STREAM_RING_FRAMES;
+    sample_count = cap * (unsigned long)wav->channels;
+    bytes = (size_t)(sample_count * sizeof(short));
+    wav->ring_a = (short*)malloc(bytes);
+    wav->ring_b = (short*)malloc(bytes);
+    if (wav->ring_a == NULL || wav->ring_b == NULL) {
+        free(wav->ring_a);
+        free(wav->ring_b);
+        wav->ring_a = NULL;
+        wav->ring_b = NULL;
+        return 0;
+    }
+    wav->ring_cap = cap;
+    wav->ring_play_a = 1;
+    wav->ring_fill_pending = 0;
+    wav->ring_start = 0;
+    wav->ring_count = 0;
+    return 1;
+}
+
+static short* g3_wav_play_buf(const G3WavData* wav) {
+    return wav->ring_play_a ? wav->ring_a : wav->ring_b;
+}
+
+static short* g3_wav_fill_buf(const G3WavData* wav) {
+    return wav->ring_play_a ? wav->ring_b : wav->ring_a;
+}
+
+static int g3_wav_read_pcm_at(G3WavData* wav, unsigned long start_frame, unsigned long num_frames, short* dst) {
+    unsigned long byte_count;
+    unsigned long byte_off;
+    long readCount;
+    OSErr err;
+    short ioRef;
+
+    if (wav == NULL || dst == NULL || num_frames == 0 || wav->frame_count == 0) return 0;
+    if (start_frame >= wav->frame_count) return 0;
+    if (start_frame + num_frames > wav->frame_count)
+        num_frames = wav->frame_count - start_frame;
+
+    byte_count = num_frames * (unsigned long)wav->channels * sizeof(short);
+    if (wav->backend == G3_WAV_MEMORY) {
+        if (wav->samples == NULL) return 0;
+        memcpy(dst, wav->samples + (start_frame * (unsigned long)wav->channels), (size_t)byte_count);
+        return 1;
+    }
+    if (wav->backend != G3_WAV_FILE) return 0;
+
+    byte_off = wav->data_offset + start_frame * (unsigned long)wav->channels * sizeof(short);
+    ioRef = wav->scanRefNum >= 0 ? wav->scanRefNum : wav->refNum;
+    if (ioRef >= 0) {
+        err = SetFPos(ioRef, fsFromStart, (long)byte_off);
+        if (err != noErr) return 0;
+        readCount = (long)byte_count;
+        err = FSRead(ioRef, &readCount, dst);
+        if (err != noErr || (unsigned long)readCount != byte_count) return 0;
+    } else if (wav->stdio_file != NULL) {
+        if (fseek(wav->stdio_file, (long)byte_off, SEEK_SET) != 0) return 0;
+        if (fread(dst, 1, (size_t)byte_count, wav->stdio_file) != (size_t)byte_count) return 0;
+    } else {
+        return 0;
+    }
+    g3_pcm16_le_to_host(dst, byte_count);
+    return 1;
+}
+
+static int g3_wav_read_pcm_ring(G3WavData* wav, unsigned long start_frame, unsigned long num_frames, short* dst) {
+    unsigned long byte_count;
+    unsigned long byte_off;
+    long readCount;
+    OSErr err;
+
+    if (wav == NULL || dst == NULL || num_frames == 0 || wav->frame_count == 0) return 0;
+    if (start_frame >= wav->frame_count) return 0;
+    if (start_frame + num_frames > wav->frame_count)
+        num_frames = wav->frame_count - start_frame;
+
+    byte_count = num_frames * (unsigned long)wav->channels * sizeof(short);
+    if (wav->backend != G3_WAV_FILE || wav->refNum < 0) return g3_wav_read_pcm_at(wav, start_frame, num_frames, dst);
+
+    byte_off = wav->data_offset + start_frame * (unsigned long)wav->channels * sizeof(short);
+    err = SetFPos(wav->refNum, fsFromStart, (long)byte_off);
+    if (err != noErr) return 0;
+    readCount = (long)byte_count;
+    err = FSRead(wav->refNum, &readCount, dst);
+    if (err != noErr || (unsigned long)readCount != byte_count) return 0;
+    g3_pcm16_le_to_host(dst, byte_count);
+    return 1;
+}
+
+static int g3_wav_stage_fill(G3WavData* wav, unsigned long start_frame) {
+    unsigned long num_frames;
+    short* dst;
+    if (wav == NULL || wav->backend == G3_WAV_MEMORY) return 1;
+    if (wav->ring_a == NULL || wav->ring_b == NULL) return 0;
+    if (wav->ring_fill_pending) return 1;
+    if (start_frame >= wav->frame_count) return 0;
+    num_frames = wav->ring_cap;
+    if (start_frame + num_frames > wav->frame_count)
+        num_frames = wav->frame_count - start_frame;
+    dst = g3_wav_fill_buf(wav);
+    if (!g3_wav_read_pcm_ring(wav, start_frame, num_frames, dst)) return 0;
+    wav->ring_fill_start = start_frame;
+    wav->ring_fill_count = num_frames;
+    wav->ring_fill_pending = 1;
+    return 1;
+}
+
+static void g3_wav_invalidate_ring(G3WavData* wav) {
+    if (wav != NULL) {
+        wav->ring_count = 0;
+        wav->ring_fill_pending = 0;
+    }
+}
+
+static void g3_wav_ring_do_swap(G3WavData* wav) {
+    wav->ring_play_a = wav->ring_play_a ? 0 : 1;
+    wav->ring_start = wav->ring_fill_start;
+    wav->ring_count = wav->ring_fill_count;
+    wav->ring_fill_pending = 0;
+}
+
+static void g3_wav_ring_try_swap(G3Deck* deck) {
+    G3WavData* wav;
+    unsigned long fp;
+    if (deck == NULL || !deck->loaded) return;
+    wav = &deck->wav;
+    if (wav->backend == G3_WAV_MEMORY) return;
+    if (!wav->ring_fill_pending) return;
+    fp = (unsigned long)deck->frame_pos;
+    if (wav->ring_count == 0) {
+        g3_wav_ring_do_swap(wav);
+        return;
+    }
+    if (fp >= wav->ring_fill_start && fp < wav->ring_fill_start + wav->ring_fill_count) {
+        g3_wav_ring_do_swap(wav);
+    }
+}
+
+static void g3_wav_get_frame(const G3WavData* wav, unsigned long frame, short* out_l, short* out_r) {
+    if (wav->backend == G3_WAV_MEMORY) {
+        if (wav->channels == 1) {
+            *out_l = wav->samples[frame];
+            *out_r = *out_l;
+        } else {
+            *out_l = wav->samples[(frame * 2) + 0];
+            *out_r = wav->samples[(frame * 2) + 1];
+        }
+    } else {
+        const short* rb = g3_wav_play_buf(wav);
+        unsigned long idx = frame - wav->ring_start;
+        if (idx >= wav->ring_count) {
+            *out_l = 0;
+            *out_r = 0;
+            return;
+        }
+        if (wav->channels == 1) {
+            *out_l = rb[idx];
+            *out_r = *out_l;
+        } else {
+            *out_l = rb[(idx * 2) + 0];
+            *out_r = rb[(idx * 2) + 1];
+        }
+    }
+}
+
+static int g3_wav_ring_has_frames(const G3WavData* wav, unsigned long frame_lo, unsigned long frame_hi) {
+    (void)frame_hi;
+    if (wav == NULL || wav->frame_count == 0) return 0;
+    if (wav->backend == G3_WAV_MEMORY) return wav->samples != NULL;
+    if (wav->ring_count == 0) return 0;
+    if (frame_lo < wav->ring_start) return 0;
+    if (frame_lo >= wav->ring_start + wav->ring_count) return 0;
+    return 1;
+}
+
+static void g3_wav_pump_deck(G3Deck* deck) {
+    G3WavData* wav;
+    unsigned long cur;
+    unsigned long play_end;
+    if (deck == NULL || !deck->loaded) return;
+    wav = &deck->wav;
+    if (wav->backend == G3_WAV_MEMORY) return;
+    if (deck->state != G3_TRANSPORT_PLAYING) return;
+    cur = (unsigned long)deck->frame_pos;
+    if (!g3_wav_ring_has_frames(wav, cur, cur)) {
+        unsigned long refill = cur;
+        if (wav->ring_cap > 0 && wav->frame_count > wav->ring_cap &&
+            refill + wav->ring_cap > wav->frame_count) {
+            refill = wav->frame_count - wav->ring_cap;
+        }
+        if (!wav->ring_fill_pending) g3_wav_stage_fill(wav, refill);
+        return;
+    }
+    if (wav->ring_fill_pending || wav->ring_count == 0) return;
+    play_end = wav->ring_start + wav->ring_count;
+    if (cur + G3_STREAM_PREFETCH_FRAMES >= play_end) {
+        unsigned long next = play_end;
+        if (next < wav->frame_count) g3_wav_stage_fill(wav, next);
+    }
+}
+
+static short g3_fclip_to_i16(double v) {
+    long s;
+    if (v > 32767.0) v = 32767.0;
+    if (v < -32768.0) v = -32768.0;
+    s = (long)(v + (v >= 0.0 ? 0.5 : -0.5));
+    return (short)s;
+}
 
 int g3_player_load_wav_bytes(G3Player* player, int deck_index, const void* bytes, unsigned long size) {
     const unsigned char* p = (const unsigned char*)bytes;
@@ -377,9 +698,12 @@ int g3_player_load_wav_bytes(G3Player* player, int deck_index, const void* bytes
     g3_pcm16_le_to_host(pcm, pcm_bytes);
 
     g3_player_unload(player, deck_index);
+    deck->wav.backend = G3_WAV_MEMORY;
+    deck->wav.refNum = -1;
     deck->wav.samples = pcm;
     deck->wav.channels = (int)fmt_channels;
     deck->wav.frame_count = pcm_bytes / (unsigned long)(fmt_channels * 2);
+    deck->wav.pcm_bytes = pcm_bytes;
     deck->loaded = 1;
     deck->state = G3_TRANSPORT_STOPPED;
     deck->frame_pos = 0.0;
@@ -400,8 +724,8 @@ int g3_player_load_wav(G3Player* player, int deck_index, const char* path) {
     unsigned short fmt_channels = 0;
     unsigned short fmt_bits = 0;
     unsigned long fmt_rate = 0;
-    short* pcm = NULL;
     unsigned long pcm_bytes = 0;
+    unsigned long data_offset = 0;
     G3Deck* deck;
 
     if (!g3_clamp_deck_index(deck_index)) return 0;
@@ -437,10 +761,8 @@ int g3_player_load_wav(G3Player* player, int deck_index, const char* path) {
             got_fmt = 1;
         } else if (memcmp(chunk_id, "data", 4) == 0) {
             pcm_bytes = chunk_size;
-            pcm = (short*)malloc((size_t)pcm_bytes);
-            if (!pcm) { fclose(f); return 0; }
-            if (fread(pcm, 1, (size_t)pcm_bytes, f) != (size_t)pcm_bytes) {
-                free(pcm);
+            data_offset = (unsigned long)ftell(f);
+            if (fseek(f, (long)chunk_size, SEEK_CUR) != 0) {
                 fclose(f);
                 return 0;
             }
@@ -451,24 +773,29 @@ int g3_player_load_wav(G3Player* player, int deck_index, const char* path) {
 
         if (chunk_size & 1u) fseek(f, 1L, SEEK_CUR);
     }
-    fclose(f);
 
     if (!got_fmt || !got_data) {
-        free(pcm);
+        fclose(f);
         return 0;
     }
 
     if (fmt_audio != 1 || (fmt_channels != 1 && fmt_channels != 2) || fmt_bits != 16 || fmt_rate != G3_SAMPLE_RATE) {
-        free(pcm);
+        fclose(f);
         return 0;
     }
 
-    g3_pcm16_le_to_host(pcm, pcm_bytes);
-
     g3_player_unload(player, deck_index);
-    deck->wav.samples = pcm;
+    deck->wav.backend = G3_WAV_FILE;
+    deck->wav.refNum = -1;
+    deck->wav.stdio_file = f;
+    deck->wav.data_offset = data_offset;
+    deck->wav.pcm_bytes = pcm_bytes;
     deck->wav.channels = (int)fmt_channels;
     deck->wav.frame_count = pcm_bytes / (unsigned long)(fmt_channels * 2);
+    if (!g3_wav_open_ring(&deck->wav)) {
+        g3_wav_close(&deck->wav);
+        return 0;
+    }
     deck->loaded = 1;
     deck->state = G3_TRANSPORT_STOPPED;
     deck->frame_pos = 0.0;
@@ -482,7 +809,7 @@ void g3_player_unload(G3Player* player, int deck_index) {
     G3Deck* deck;
     if (!g3_clamp_deck_index(deck_index)) return;
     deck = &player->decks[deck_index];
-    free(deck->wav.samples);
+    g3_wav_close(&deck->wav);
     g3_deck_reset(deck, deck_index);
 }
 
@@ -492,17 +819,17 @@ void g3_player_play(G3Player* player, int deck_index) {
     deck = &player->decks[deck_index];
     if (!deck->loaded) return;
     if (deck->state == G3_TRANSPORT_FROZEN) {
-        deck->speed_target = 1.0 + ((double)deck->pitch_percent / 100.0);
-        if (deck->speed_target < 0.000001) deck->speed_target = 0.000001;
-        if (deck->ramp_seconds <= 0.0001f) deck->speed_current = deck->speed_target;
+        g3_deck_resume_from_freeze(deck);
         g3_freeze_begin_unfreeze(deck);
         deck->state = G3_TRANSPORT_PLAYING;
+        g3_wav_pump_deck(deck);
         return;
     }
     deck->state = G3_TRANSPORT_PLAYING;
     deck->speed_target = 1.0 + ((double)deck->pitch_percent / 100.0);
     if (deck->speed_target < 0.000001) deck->speed_target = 0.000001;
     if (deck->ramp_seconds <= 0.0001f) deck->speed_current = deck->speed_target;
+    g3_wav_pump_deck(deck);
 }
 
 void g3_player_pause(G3Player* player, int deck_index) {
@@ -510,8 +837,16 @@ void g3_player_pause(G3Player* player, int deck_index) {
     if (!g3_clamp_deck_index(deck_index)) return;
     deck = &player->decks[deck_index];
     if (!deck->loaded) return;
-    if (deck->state == G3_TRANSPORT_FROZEN) return;
+    if (deck->state == G3_TRANSPORT_FROZEN) {
+        if (deck->freeze.buffer != NULL) g3_freeze_release_deck(deck_index, &deck->freeze);
+        deck->speed_target = 0.0;
+        deck->speed_current = 0.0;
+        deck->state = G3_TRANSPORT_PAUSED;
+        return;
+    }
+    if (deck->freeze.buffer != NULL) g3_freeze_release_deck(deck_index, &deck->freeze);
     deck->speed_target = 0.0;
+    deck->speed_current = 0.0;
     deck->state = G3_TRANSPORT_PAUSED;
 }
 
@@ -520,25 +855,27 @@ void g3_player_stop(G3Player* player, int deck_index) {
     if (!g3_clamp_deck_index(deck_index)) return;
     deck = &player->decks[deck_index];
     if (!deck->loaded) return;
-    if (deck->state == G3_TRANSPORT_FROZEN) g3_freeze_end_capture(deck, deck_index);
+    if (deck->freeze.buffer != NULL) g3_freeze_release_deck(deck_index, &deck->freeze);
     deck->speed_target = 0.0;
+    deck->speed_current = 0.0;
     deck->state = G3_TRANSPORT_STOPPED;
+    deck->frame_pos = 0.0;
 }
 
 static int g3_freeze_begin(G3Deck* deck, int deck_index) {
-    int g;
     unsigned long window_frames;
     unsigned long half_frames;
     unsigned long start_frame;
     unsigned long copy_samples;
     unsigned long bytes;
     short* dst;
-    const short* src;
     G3FreezeCapture* fz;
 
-    if (deck == NULL || !deck->loaded || deck->wav.samples == NULL || deck->wav.frame_count == 0) return 0;
+    if (deck == NULL || !deck->loaded || deck->wav.frame_count == 0) return 0;
 
+    g3_freeze_drain_pending();
     g3_freeze_release_deck(deck_index, &deck->freeze);
+    g3_freeze_drain_pending();
     fz = &deck->freeze;
 
     window_frames = g3_ms_to_frames((unsigned long)G3_FREEZE_WINDOW_MS);
@@ -557,8 +894,10 @@ static int g3_freeze_begin(G3Deck* deck, int deck_index) {
     dst = (short*)malloc((size_t)bytes);
     if (dst == NULL) return 0;
 
-    src = deck->wav.samples + (start_frame * (unsigned long)deck->wav.channels);
-    memcpy(dst, src, (size_t)bytes);
+    if (!g3_wav_read_pcm_at(&deck->wav, start_frame, window_frames, dst)) {
+        free(dst);
+        return 0;
+    }
 
     fz->buffer = dst;
     fz->frame_count = window_frames;
@@ -572,22 +911,11 @@ static int g3_freeze_begin(G3Deck* deck, int deck_index) {
     if (fz->fade_length_samples < 1) fz->fade_length_samples = 1;
     if (fz->fade_length_samples > fz->grain_length_samples / 2)
         fz->fade_length_samples = fz->grain_length_samples / 2;
-    fz->spawn_accum = 0.0;
-    for (g = 0; g < G3_FREEZE_MAX_GRAINS; ++g) {
-        fz->grains[g].active = 0;
-        fz->grains[g].age = 0;
-        fz->grains[g].length = 0;
-    }
     gFreezeRng = (unsigned long)TickCount() | 1UL;
-    for (g = 0; g < 3; ++g) {
-        if (g3_spawn_grain(fz)) {
-            unsigned long stagger = (fz->grain_length_samples * (unsigned long)g) / 3UL;
-            if (stagger >= fz->grains[g].length) stagger = fz->grains[g].length - 1;
-            fz->grains[g].age = stagger;
-        }
-    }
+    g3_freeze_seed_grains(fz);
     g3_freeze_start_xfade(fz, G3_FREEZE_XFADE_IN);
 
+    fz->playback_speed = g3_freeze_pitch_speed(deck);
     deck->speed_target = 0.0;
     deck->speed_current = 0.0;
     deck->state = G3_TRANSPORT_FROZEN;
@@ -600,13 +928,16 @@ int g3_player_toggle_freeze(G3Player* player, int deck_index) {
     deck = &player->decks[deck_index];
     if (!deck->loaded) return 0;
     if (deck->state == G3_TRANSPORT_FROZEN) {
-        deck->speed_target = 1.0 + ((double)deck->pitch_percent / 100.0);
-        if (deck->speed_target < 0.000001) deck->speed_target = 0.000001;
-        if (deck->ramp_seconds <= 0.0001f) deck->speed_current = deck->speed_target;
+        g3_deck_resume_from_freeze(deck);
         g3_freeze_begin_unfreeze(deck);
         deck->state = G3_TRANSPORT_PLAYING;
+        g3_wav_pump_deck(deck);
         return 0;
     }
+    /* Ignore re-freeze while still crossfading out of a previous unfreeze. */
+    if (deck->state == G3_TRANSPORT_PLAYING && deck->freeze.buffer != NULL &&
+        deck->freeze.xfade_dir == G3_FREEZE_XFADE_OUT && deck->freeze.xfade_remain > 0)
+        return 2;
     if (!g3_freeze_begin(deck, deck_index)) return -1;
     return 1;
 }
@@ -622,6 +953,15 @@ void g3_player_seek_ms(G3Player* player, int deck_index, unsigned long position_
     if (frame_pos < 0.0) frame_pos = 0.0;
     if (frame_pos >= (double)deck->wav.frame_count) frame_pos = (double)(deck->wav.frame_count ? deck->wav.frame_count - 1 : 0);
     deck->frame_pos = frame_pos;
+    g3_wav_invalidate_ring(&deck->wav);
+    if (deck->wav.backend == G3_WAV_FILE) {
+        unsigned long refill = (unsigned long)frame_pos;
+        if (deck->wav.ring_cap > 0 && deck->wav.frame_count > deck->wav.ring_cap &&
+            refill + deck->wav.ring_cap > deck->wav.frame_count) {
+            refill = deck->wav.frame_count - deck->wav.ring_cap;
+        }
+        g3_wav_stage_fill(&deck->wav, refill);
+    }
 }
 
 void g3_player_set_volume(G3Player* player, int deck_index, float value) {
@@ -645,8 +985,11 @@ void g3_player_set_pitch_percent(G3Player* player, int deck_index, float value) 
     if (!g3_clamp_deck_index(deck_index)) return;
     deck = &player->decks[deck_index];
     deck->pitch_percent = g3_clampf(value, -100.0f, 100.0f);
-    if (deck->state == G3_TRANSPORT_PLAYING) {
-        deck->speed_target = 1.0 + ((double)deck->pitch_percent / 100.0);
+    if (deck->state == G3_TRANSPORT_FROZEN) {
+        deck->freeze.playback_speed = g3_freeze_pitch_speed(deck);
+        g3_freeze_seed_grains(&deck->freeze);
+    } else if (deck->state == G3_TRANSPORT_PLAYING) {
+        deck->speed_target = g3_deck_pitch_speed(deck);
     }
 }
 
@@ -712,33 +1055,33 @@ static void g3_update_speed(G3Deck* deck, int frame_count) {
 /* Same ramp law as speed: ~1 unit per ramp_seconds toward target (matches pitch motor). */
 static void g3_ramp_float_toward(float* cur, float target, double ramp_sec, int frames);
 
-static float g3_grain_envelope(unsigned long age, unsigned long length, unsigned long fade_len) {
+static float g3_grain_envelope(double age, unsigned long length, unsigned long fade_len) {
     double t;
     if (length == 0) return 0.0f;
     if (fade_len == 0) return 1.0f;
-    if (age < fade_len) {
-        t = (double)age / (double)fade_len;
+    if (fade_len > length / 2) fade_len = length / 2;
+    if (age < (double)fade_len) {
+        t = age / (double)fade_len;
         return (float)(0.5 * (1.0 - cos(M_PI * t)));
     }
-    if (age >= length - fade_len) {
-        t = (double)(length - age) / (double)fade_len;
+    if (age >= (double)length - (double)fade_len) {
+        t = ((double)length - age) / (double)fade_len;
+        if (t < 0.0) t = 0.0;
         return (float)(0.5 * (1.0 - cos(M_PI * t)));
     }
     return 1.0f;
 }
 
-/* Linear fade for freeze grains (no trig in audio callback). */
-static float g3_grain_envelope_linear(unsigned long age, unsigned long length, unsigned long fade_len) {
-    if (length == 0) return 0.0f;
-    if (fade_len == 0) return 1.0f;
-    if (age < fade_len) return (float)age / (float)fade_len;
-    if (age >= length - fade_len) return (float)(length - age) / (float)fade_len;
-    return 1.0f;
-}
-
-static double g3_soft_limit(double x) {
-    if (x > 1.0) return 1.0;
-    if (x < -1.0) return -1.0;
+static double g3_soft_saturate(double x) {
+    /* Gentle knee above unity — hard clip on summed grains causes audible clicks. */
+    if (x > 1.0) {
+        double over = x - 1.0;
+        return 1.0 + over / (1.0 + over * 4.0);
+    }
+    if (x < -1.0) {
+        double over = -x - 1.0;
+        return -1.0 - over / (1.0 + over * 4.0);
+    }
     return x;
 }
 
@@ -779,8 +1122,7 @@ static unsigned long g3_freeze_grain_length_samples(const G3FreezeCapture* fz) {
 
 static int g3_spawn_grain(G3FreezeCapture* fz) {
     int g;
-    unsigned long pick_l;
-    unsigned long pick_r;
+    unsigned long pick;
     unsigned long max_start;
     unsigned long grain_len;
     if (fz == NULL || fz->buffer == NULL || fz->frame_count < 2) return 0;
@@ -794,52 +1136,80 @@ static int g3_spawn_grain(G3FreezeCapture* fz) {
         max_start = fz->frame_count - grain_len;
     else
         max_start = 0;
-    pick_l = g3_freeze_rand();
-    pick_r = g3_freeze_rand();
-    if (max_start > 0) {
-        pick_l %= (max_start + 1);
-        pick_r %= (max_start + 1);
-    } else {
-        pick_l = 0;
-        pick_r = 0;
-    }
+    pick = g3_freeze_rand();
+    if (max_start > 0)
+        pick %= (max_start + 1);
+    else
+        pick = 0;
     fz->grains[g].active = 1;
-    fz->grains[g].start_frame_l = pick_l;
-    fz->grains[g].start_frame_r = pick_r;
+    fz->grains[g].start_frame = pick;
     fz->grains[g].age = 0;
     fz->grains[g].length = grain_len;
+    fz->grains[g].wall_samples = 0;
     return 1;
 }
 
 static void g3_grain_mix_sample(G3FreezeCapture* fz, G3Grain* gr, double* out_l, double* out_r) {
-    unsigned long frame_l;
-    unsigned long frame_r;
+    unsigned long frame_i;
+    unsigned long frame_n;
+    unsigned long pos_i;
+    unsigned long pos_n;
+    double frac;
     float env;
+    float wall_env;
     double sample_l;
     double sample_r;
+    double speed;
+    unsigned long wall_remain;
 
     if (fz == NULL || gr == NULL || !gr->active || fz->buffer == NULL) return;
-    if (gr->age >= gr->length) {
+    if (gr->age >= (double)gr->length) {
         gr->active = 0;
         return;
     }
-    frame_l = gr->start_frame_l + gr->age;
-    frame_r = gr->start_frame_r + gr->age;
-    if (frame_l >= fz->frame_count) frame_l = fz->frame_count - 1;
-    if (frame_r >= fz->frame_count) frame_r = fz->frame_count - 1;
+    speed = fz->playback_speed;
+    if (speed < G3_FREEZE_MIN_PLAYBACK_SPEED) speed = G3_FREEZE_MIN_PLAYBACK_SPEED;
 
-    env = g3_grain_envelope_linear(gr->age, gr->length, fz->fade_length_samples);
+    frame_i = (unsigned long)gr->age;
+    frame_n = frame_i + 1;
+    if (frame_n >= gr->length) frame_n = frame_i;
+    frac = gr->age - (double)frame_i;
+
+    pos_i = gr->start_frame + frame_i;
+    pos_n = gr->start_frame + frame_n;
+    if (pos_i >= fz->frame_count) pos_i = fz->frame_count - 1;
+    if (pos_n >= fz->frame_count) pos_n = fz->frame_count - 1;
+
+    env = g3_grain_envelope(gr->age, gr->length, fz->fade_length_samples);
+    wall_remain = G3_GRAIN_MAX_WALL_SAMPLES - gr->wall_samples;
+    if (wall_remain < fz->fade_length_samples) {
+        wall_env = (float)wall_remain / (float)fz->fade_length_samples;
+        if (wall_env < 0.0f) wall_env = 0.0f;
+        if (wall_env < env) env = wall_env;
+    }
+    if (env <= 0.0f) {
+        gr->active = 0;
+        return;
+    }
+
     if (fz->channels == 1) {
-        sample_l = (double)fz->buffer[frame_l] / 32768.0;
-        sample_r = (double)fz->buffer[frame_r] / 32768.0;
+        short s0 = fz->buffer[pos_i];
+        short s1 = fz->buffer[pos_n];
+        sample_l = ((double)s0 + ((double)(s1 - s0) * frac)) / 32768.0;
+        sample_r = sample_l;
     } else {
-        sample_l = (double)fz->buffer[(frame_l * 2) + 0] / 32768.0;
-        sample_r = (double)fz->buffer[(frame_r * 2) + 1] / 32768.0;
+        short l0 = fz->buffer[(pos_i * 2) + 0];
+        short l1 = fz->buffer[(pos_n * 2) + 0];
+        short r0 = fz->buffer[(pos_i * 2) + 1];
+        short r1 = fz->buffer[(pos_n * 2) + 1];
+        sample_l = ((double)l0 + ((double)(l1 - l0) * frac)) / 32768.0;
+        sample_r = ((double)r0 + ((double)(r1 - r0) * frac)) / 32768.0;
     }
     *out_l += sample_l * (double)env;
     *out_r += sample_r * (double)env;
-    gr->age++;
-    if (gr->age >= gr->length) gr->active = 0;
+    gr->age += speed;
+    gr->wall_samples++;
+    if (gr->age >= (double)gr->length || gr->wall_samples >= G3_GRAIN_MAX_WALL_SAMPLES) gr->active = 0;
 }
 
 static double sFreezeMixL[G3_FRAMES_PER_BUFFER];
@@ -867,6 +1237,8 @@ static void g3_render_frozen_buffer(int deck_index, G3Deck* deck, double* out_l,
     g3_ramp_float_toward(&deck->volume_now, deck->volume, (double)deck->ramp_seconds, frame_count);
     vol_scale = (double)deck->volume_now * (double)G3_FREEZE_OUTPUT_GAIN * (double)G3_FREEZE_MIX_HEADROOM;
     interval = (double)fz->spawn_interval_samples;
+    if (fz->playback_speed > 0.0001) interval /= fz->playback_speed;
+    if (interval > (double)G3_SAMPLE_RATE) interval = (double)G3_SAMPLE_RATE;
     if (interval < 1.0) interval = 1.0;
     peak = 0.0f;
 
@@ -895,8 +1267,8 @@ static void g3_render_frozen_buffer(int deck_index, G3Deck* deck, double* out_l,
             float xfade = g3_freeze_xfade_gain_at(fz, (unsigned long)si);
             vol_scale = (double)deck->volume_now * (double)G3_FREEZE_OUTPUT_GAIN * (double)G3_FREEZE_MIX_HEADROOM *
                         (double)xfade;
-            sample_l = g3_soft_limit(grain_l * vol_scale);
-            sample_r = g3_soft_limit(grain_r * vol_scale);
+            sample_l = g3_soft_saturate(grain_l * vol_scale);
+            sample_r = g3_soft_saturate(grain_r * vol_scale);
         }
         out_l[si] += sample_l;
         out_r[si] += sample_r;
@@ -911,6 +1283,8 @@ static void g3_render_frozen_buffer(int deck_index, G3Deck* deck, double* out_l,
         else
             fz->xfade_remain -= (unsigned long)frame_count;
     }
+    if (fz->xfade_dir == G3_FREEZE_XFADE_IN && fz->xfade_remain == 0)
+        fz->xfade_dir = G3_FREEZE_XFADE_NONE;
     if (fz->xfade_dir == G3_FREEZE_XFADE_OUT && fz->xfade_remain == 0)
         g3_freeze_release_deck(deck_index, fz);
 
@@ -937,6 +1311,24 @@ static void g3_ramp_float_toward(float* cur, float target, double ramp_sec, int 
         if (c < t) c = t;
     }
     *cur = (float)c;
+}
+
+static int g3_deck_interp_sample(G3Deck* deck, long frame_i, long frame_n, double frac, double* out_l, double* out_r) {
+    short s0l, s0r, s1l, s1r;
+    G3WavData* wav;
+    unsigned long play_end;
+    if (deck == NULL || out_l == NULL || out_r == NULL) return 0;
+    wav = &deck->wav;
+    if (!g3_wav_ring_has_frames(wav, (unsigned long)frame_i, (unsigned long)frame_n)) return 0;
+    if (wav->backend != G3_WAV_MEMORY && wav->ring_count > 0) {
+        play_end = wav->ring_start + wav->ring_count;
+        if ((unsigned long)frame_n >= play_end) frame_n = (long)(play_end - 1UL);
+    }
+    g3_wav_get_frame(wav, (unsigned long)frame_i, &s0l, &s0r);
+    g3_wav_get_frame(wav, (unsigned long)frame_n, &s1l, &s1r);
+    *out_l = ((double)s0l + ((double)(s1l - s0l) * frac)) / 32768.0;
+    *out_r = ((double)s0r + ((double)(s1r - s0r) * frac)) / 32768.0;
+    return 1;
 }
 
 int g3_player_render(G3Player* player, short* out_stereo, int frame_count) {
@@ -978,10 +1370,11 @@ int g3_player_render(G3Player* player, short* out_stereo, int frame_count) {
             float abs_local;
 
             if (!deck->loaded) continue;
+            g3_wav_ring_try_swap(deck);
             if (deck->state == G3_TRANSPORT_FROZEN) {
                 G3FreezeCapture* fz_in = &deck->freeze;
                 if (fz_in->buffer != NULL && fz_in->xfade_dir == G3_FREEZE_XFADE_IN && fz_in->xfade_remain > 0 &&
-                    deck->wav.samples != NULL && deck->wav.frame_count > 1) {
+                    deck->wav.frame_count > 1) {
                     float xfade = g3_freeze_xfade_gain_at(fz_in, (unsigned long)i);
                     double play_l;
                     double play_r;
@@ -990,19 +1383,7 @@ int g3_player_render(G3Player* player, short* out_stereo, int frame_count) {
                     frame_n = frame_i + 1;
                     if (frame_n >= (long)deck->wav.frame_count) frame_n = frame_i;
                     frac = deck->frame_pos - (double)frame_i;
-                    if (deck->wav.channels == 1) {
-                        short s0 = deck->wav.samples[frame_i];
-                        short s1 = deck->wav.samples[frame_n];
-                        play_l = ((double)s0 + ((double)(s1 - s0) * frac)) / 32768.0;
-                        play_r = play_l;
-                    } else {
-                        short l0 = deck->wav.samples[(frame_i * 2) + 0];
-                        short r0 = deck->wav.samples[(frame_i * 2) + 1];
-                        short l1 = deck->wav.samples[(frame_n * 2) + 0];
-                        short r1 = deck->wav.samples[(frame_n * 2) + 1];
-                        play_l = ((double)l0 + ((double)(l1 - l0) * frac)) / 32768.0;
-                        play_r = ((double)r0 + ((double)(r1 - r0) * frac)) / 32768.0;
-                    }
+                    if (!g3_deck_interp_sample(deck, frame_i, frame_n, frac, &play_l, &play_r)) continue;
                     {
                         double p = (double)((deck->pan_now + 1.0f) * 0.5f);
                         left_gain = cos((M_PI * 0.5) * p);
@@ -1039,19 +1420,7 @@ int g3_player_render(G3Player* player, short* out_stereo, int frame_count) {
             if (frame_n >= (long)deck->wav.frame_count) frame_n = frame_i;
             frac = deck->frame_pos - (double)frame_i;
 
-            if (deck->wav.channels == 1) {
-                short s0 = deck->wav.samples[frame_i];
-                short s1 = deck->wav.samples[frame_n];
-                mono_or_l = ((double)s0 + ((double)(s1 - s0) * frac)) / 32768.0;
-                right = mono_or_l;
-            } else {
-                short l0 = deck->wav.samples[(frame_i * 2) + 0];
-                short r0 = deck->wav.samples[(frame_i * 2) + 1];
-                short l1 = deck->wav.samples[(frame_n * 2) + 0];
-                short r1 = deck->wav.samples[(frame_n * 2) + 1];
-                mono_or_l = ((double)l0 + ((double)(l1 - l0) * frac)) / 32768.0;
-                right = ((double)r0 + ((double)(r1 - r0) * frac)) / 32768.0;
-            }
+            if (!g3_deck_interp_sample(deck, frame_i, frame_n, frac, &mono_or_l, &right)) continue;
 
             {
                 double p = (double)((deck->pan_now + 1.0f) * 0.5f);
@@ -1076,16 +1445,11 @@ int g3_player_render(G3Player* player, short* out_stereo, int frame_count) {
             deck->frame_pos += deck->speed_current;
         }
 
-        mix_l *= player->master_volume;
-        mix_r *= player->master_volume;
+        mix_l *= (double)player->master_volume;
+        mix_r *= (double)player->master_volume;
 
-        if (mix_l > 1.0) mix_l = 1.0;
-        if (mix_l < -1.0) mix_l = -1.0;
-        if (mix_r > 1.0) mix_r = 1.0;
-        if (mix_r < -1.0) mix_r = -1.0;
-
-        out_stereo[(i * 2) + 0] = (short)(mix_l * 32767.0);
-        out_stereo[(i * 2) + 1] = (short)(mix_r * 32767.0);
+        out_stereo[(i * 2) + 0] = g3_fclip_to_i16(mix_l * 32767.0);
+        out_stereo[(i * 2) + 1] = g3_fclip_to_i16(mix_r * 32767.0);
 
         {
             float abs_master = (float)(fabs(mix_l) > fabs(mix_r) ? fabs(mix_l) : fabs(mix_r));
@@ -1101,14 +1465,16 @@ int g3_player_render(G3Player* player, short* out_stereo, int frame_count) {
 
 #define FRAMES_PER_BUFFER G3_FRAMES_PER_BUFFER
 #define WINDOW_W 800
-#define WINDOW_H 656
 #define WAVE_RIGHT (WINDOW_W - 20)
 #define WAVE_POINTS 320
+#define G3_WAVE_CACHE_MAGIC 0x47335756UL /* "G3WV" */
+#define G3_WAVE_CACHE_VERSION 1
+#define G3_WAVE_REBUILD_CHUNK 32
 #define PEAK_DISPLAY_DECAY_DB 2.0f
 #define DEFAULT_DECK_VOL 0.8f
 #define MASTER_DB_MIN (-60.0f)
 #define MASTER_DB_MAX (24.0f)
-#define MASTER_DB_DEFAULT (-4.0f)
+#define MASTER_DB_DEFAULT (0.0f)
 #define MASTER_SLIDER_STEPS 840 /* 0.1 dB steps: -60.0 .. +24.0 */
 /* Top of content = D1-D3 only (no banner text). */
 #define DECK_TAB_TOP 18
@@ -1166,6 +1532,11 @@ int g3_player_render(G3Player* player, short* out_stereo, int frame_count) {
 #define BTN_LEFT 676
 #define BTN_RIGHT 734
 #define SLIDER_VAL_COUNT 5
+#define WINDOW_CONTENT_BOTTOM (MSG_ROW_B + 12)
+#define WINDOW_CHROME_EXTRA 38
+#define WINDOW_H (WINDOW_CONTENT_BOTTOM + WINDOW_CHROME_EXTRA)
+#define TARGET_SCREEN_W 1024
+#define TARGET_SCREEN_H 768
 
 static G3Player gPlayer;
 static int gRunning = 1;
@@ -1206,6 +1577,9 @@ static Rect gMessageRect;
 static short gWaveMin[G3_DECK_COUNT][WAVE_POINTS];
 static short gWaveMax[G3_DECK_COUNT][WAVE_POINTS];
 static char gDeckFileName[G3_DECK_COUNT][64];
+static FSSpec gDeckFileSpec[G3_DECK_COUNT];
+static int gDeckHasFileSpec[G3_DECK_COUNT];
+static unsigned long gDeckSrcModTime[G3_DECK_COUNT];
 static char gLastMessage[192] = "Ready.";
 static long gUiTickCounter = 0;
 static int gWaveRebuildDeck = -1;
@@ -1284,10 +1658,179 @@ static void CopyPascalToCString(const unsigned char* pstr, char* dst, size_t dst
     dst[len] = '\0';
 }
 
+static unsigned long G3GetFSSpecModDate(const FSSpec* spec) {
+    CInfoPBRec pb;
+    Str255 pName;
+    OSErr err;
+    if (spec == NULL) return 0;
+    BlockMoveData(spec->name, pName, (Size)(1 + spec->name[0]));
+    pb.hFileInfo.ioNamePtr = pName;
+    pb.hFileInfo.ioVRefNum = spec->vRefNum;
+    pb.hFileInfo.ioFDirIndex = 0;
+    pb.hFileInfo.ioDirID = spec->parID;
+    err = PBGetCatInfo(&pb, false);
+    if (err != noErr) return 0;
+    return (unsigned long)pb.hFileInfo.ioFlMdDat;
+}
+
 static void SetDeckFileNameFromFSSpec(int deck_index, const FSSpec* spec) {
     if (deck_index < 0 || deck_index >= G3_DECK_COUNT || spec == NULL) return;
     CopyPascalToCString((const unsigned char*)spec->name, gDeckFileName[deck_index],
                         sizeof(gDeckFileName[deck_index]));
+    gDeckFileSpec[deck_index] = *spec;
+    gDeckHasFileSpec[deck_index] = 1;
+    gDeckSrcModTime[deck_index] = G3GetFSSpecModDate(spec);
+}
+
+static void g3_put_u32_le(unsigned char* p, unsigned long v) {
+    p[0] = (unsigned char)(v & 0xffUL);
+    p[1] = (unsigned char)((v >> 8) & 0xffUL);
+    p[2] = (unsigned char)((v >> 16) & 0xffUL);
+    p[3] = (unsigned char)((v >> 24) & 0xffUL);
+}
+
+static unsigned long g3_get_u32_le(const unsigned char* p) {
+    return ((unsigned long)p[0]) | ((unsigned long)p[1] << 8) | ((unsigned long)p[2] << 16) |
+           ((unsigned long)p[3] << 24);
+}
+
+static unsigned short g3_get_u16_le(const unsigned char* p) {
+    return (unsigned short)(p[0] | (p[1] << 8));
+}
+
+static void WaveCacheSpecFromAudio(const FSSpec* audio, FSSpec* cacheOut) {
+    char cname[64];
+    char* dot;
+    Str255 pname;
+    if (audio == NULL || cacheOut == NULL) return;
+    *cacheOut = *audio;
+    CopyPascalToCString((const unsigned char*)audio->name, cname, sizeof(cname));
+    dot = strrchr(cname, '.');
+    if (dot != NULL) *dot = '\0';
+    strncat(cname, ".g3w", sizeof(cname) - strlen(cname) - 1);
+    MakePString(cname, pname);
+    BlockMoveData(pname, cacheOut->name, (Size)(1 + pname[0]));
+}
+
+static int TryLoadWaveformCache(int deck_index) {
+    FSSpec cacheSpec;
+    short refNum;
+    OSErr err;
+    unsigned char hdr[24];
+    long readCount;
+    unsigned long magic;
+    unsigned short version;
+    unsigned short channels;
+    unsigned long frame_count;
+    unsigned long pcm_bytes;
+    unsigned long src_mod;
+    unsigned short points;
+    const G3Deck* deck;
+    unsigned char* body;
+    unsigned long bodyBytes;
+    int i;
+    if (deck_index < 0 || deck_index >= G3_DECK_COUNT) return 0;
+    if (!gDeckHasFileSpec[deck_index]) return 0;
+    deck = &gPlayer.decks[deck_index];
+    if (!deck->loaded) return 0;
+    WaveCacheSpecFromAudio(&gDeckFileSpec[deck_index], &cacheSpec);
+    err = FSpOpenDF(&cacheSpec, fsRdPerm, &refNum);
+    if (err != noErr) return 0;
+    readCount = 24;
+    err = FSRead(refNum, &readCount, hdr);
+    if (err != noErr || readCount != 24) {
+        FSClose(refNum);
+        return 0;
+    }
+    magic = g3_get_u32_le(hdr + 0);
+    version = g3_get_u16_le(hdr + 4);
+    channels = g3_get_u16_le(hdr + 6);
+    frame_count = g3_get_u32_le(hdr + 8);
+    pcm_bytes = g3_get_u32_le(hdr + 12);
+    src_mod = g3_get_u32_le(hdr + 16);
+    points = g3_get_u16_le(hdr + 20);
+    if (magic != G3_WAVE_CACHE_MAGIC || version != G3_WAVE_CACHE_VERSION || points != WAVE_POINTS ||
+        channels != (unsigned short)deck->wav.channels || frame_count != deck->wav.frame_count ||
+        pcm_bytes != deck->wav.pcm_bytes || src_mod != gDeckSrcModTime[deck_index]) {
+        FSClose(refNum);
+        return 0;
+    }
+    bodyBytes = (unsigned long)WAVE_POINTS * 2UL * (unsigned long)sizeof(short);
+    body = (unsigned char*)malloc((size_t)bodyBytes);
+    if (body == NULL) {
+        FSClose(refNum);
+        return 0;
+    }
+    readCount = (long)bodyBytes;
+    err = FSRead(refNum, &readCount, body);
+    FSClose(refNum);
+    if (err != noErr || (unsigned long)readCount != bodyBytes) {
+        free(body);
+        return 0;
+    }
+    for (i = 0; i < WAVE_POINTS; ++i) {
+        gWaveMin[deck_index][i] = (short)g3_get_u16_le(body + (i * 4) + 0);
+        gWaveMax[deck_index][i] = (short)g3_get_u16_le(body + (i * 4) + 2);
+    }
+    free(body);
+    return 1;
+}
+
+static void SaveWaveformCache(int deck_index) {
+    FSSpec cacheSpec;
+    short refNum;
+    OSErr err;
+    unsigned char hdr[24];
+    unsigned char* body;
+    unsigned long bodyBytes;
+    long writeCount;
+    const G3Deck* deck;
+    int i;
+    if (deck_index < 0 || deck_index >= G3_DECK_COUNT) return;
+    if (!gDeckHasFileSpec[deck_index]) return;
+    deck = &gPlayer.decks[deck_index];
+    if (!deck->loaded) return;
+    WaveCacheSpecFromAudio(&gDeckFileSpec[deck_index], &cacheSpec);
+    err = FSpCreate(&cacheSpec, 0, 0, 0);
+    if (err != noErr && err != dupFNErr) return;
+    err = FSpOpenDF(&cacheSpec, fsWrPerm, &refNum);
+    if (err != noErr) return;
+    SetFPos(refNum, fsFromStart, 0L);
+    g3_put_u32_le(hdr + 0, G3_WAVE_CACHE_MAGIC);
+    hdr[4] = (unsigned char)(G3_WAVE_CACHE_VERSION & 0xff);
+    hdr[5] = (unsigned char)((G3_WAVE_CACHE_VERSION >> 8) & 0xff);
+    hdr[6] = (unsigned char)(deck->wav.channels & 0xff);
+    hdr[7] = (unsigned char)((deck->wav.channels >> 8) & 0xff);
+    g3_put_u32_le(hdr + 8, deck->wav.frame_count);
+    g3_put_u32_le(hdr + 12, deck->wav.pcm_bytes);
+    g3_put_u32_le(hdr + 16, gDeckSrcModTime[deck_index]);
+    hdr[20] = (unsigned char)(WAVE_POINTS & 0xff);
+    hdr[21] = (unsigned char)((WAVE_POINTS >> 8) & 0xff);
+    hdr[22] = 0;
+    hdr[23] = 0;
+    writeCount = 24;
+    err = FSWrite(refNum, &writeCount, hdr);
+    if (err != noErr || writeCount != 24) {
+        FSClose(refNum);
+        return;
+    }
+    bodyBytes = (unsigned long)WAVE_POINTS * 2UL * (unsigned long)sizeof(short);
+    body = (unsigned char*)malloc((size_t)bodyBytes);
+    if (body == NULL) {
+        FSClose(refNum);
+        return;
+    }
+    for (i = 0; i < WAVE_POINTS; ++i) {
+        body[(i * 4) + 0] = (unsigned char)((unsigned short)gWaveMin[deck_index][i] & 0xff);
+        body[(i * 4) + 1] = (unsigned char)(((unsigned short)gWaveMin[deck_index][i] >> 8) & 0xff);
+        body[(i * 4) + 2] = (unsigned char)((unsigned short)gWaveMax[deck_index][i] & 0xff);
+        body[(i * 4) + 3] = (unsigned char)(((unsigned short)gWaveMax[deck_index][i] >> 8) & 0xff);
+    }
+    writeCount = (long)bodyBytes;
+    err = FSWrite(refNum, &writeCount, body);
+    free(body);
+    if (err == noErr) SetEOF(refNum, 24L + (long)bodyBytes);
+    FSClose(refNum);
 }
 
 static void UiPumpEvents(void) {
@@ -1301,22 +1844,22 @@ static void UiPumpEvents(void) {
 }
 
 static void FreeDeckSamplesSafe(int deck_index, G3Deck* deck) {
-    short* old;
     if (deck == NULL) return;
-    old = deck->wav.samples;
-    if (old == NULL) return;
+    if (deck->wav.backend == G3_WAV_NONE && deck->wav.samples == NULL && deck->wav.refNum < 0 &&
+        deck->wav.scanRefNum < 0 && deck->wav.stdio_file == NULL) {
+        return;
+    }
     g3_freeze_release_deck(deck_index, &deck->freeze);
     deck->loaded = 0;
-    deck->wav.samples = NULL;
-    deck->wav.frame_count = 0;
-    deck->wav.channels = 0;
     deck->state = G3_TRANSPORT_STOPPED;
     deck->frame_pos = 0.0;
     deck->speed_current = 0.0;
     deck->speed_target = 0.0;
     UiPumpEvents();
     UiPumpEvents();
-    free(old);
+    g3_wav_close(&deck->wav);
+    gDeckHasFileSpec[deck_index] = 0;
+    gDeckSrcModTime[deck_index] = 0;
 }
 
 #if defined(__POWERPC__) || defined(__ppc__) || defined(powerc) || defined(__CFM68K__) || \
@@ -1657,39 +2200,53 @@ static void RefreshFreezeButton(void) {
     Draw1Control(gFreezeBtn);
 }
 
+#define G3_WAVE_SCAN_BLOCK_FRAMES 4096
+
 static void RebuildWaveformBucket(int deck_index, int point_index) {
     G3Deck* deck;
+    G3WavData* wav;
     unsigned long start;
     unsigned long end;
     long mn;
     long mx;
-    unsigned long f;
+    unsigned long pos;
+    short block[G3_WAVE_SCAN_BLOCK_FRAMES * 2];
     if (deck_index < 0 || deck_index >= G3_DECK_COUNT) return;
     if (point_index < 0 || point_index >= WAVE_POINTS) return;
     deck = &gPlayer.decks[deck_index];
-    if (!deck->loaded || deck->wav.frame_count == 0 || deck->wav.samples == NULL) {
+    wav = &deck->wav;
+    if (!deck->loaded || wav->frame_count == 0) {
         gWaveMin[deck_index][point_index] = 0;
         gWaveMax[deck_index][point_index] = 0;
         return;
     }
 
-    start = (unsigned long)(((double)point_index * (double)deck->wav.frame_count) / (double)WAVE_POINTS);
-    end = (unsigned long)(((double)(point_index + 1) * (double)deck->wav.frame_count) / (double)WAVE_POINTS);
+    start = (unsigned long)(((double)point_index * (double)wav->frame_count) / (double)WAVE_POINTS);
+    end = (unsigned long)(((double)(point_index + 1) * (double)wav->frame_count) / (double)WAVE_POINTS);
     mn = 32767;
     mx = -32768;
     if (end <= start) end = start + 1;
-    if (end > deck->wav.frame_count) end = deck->wav.frame_count;
-    for (f = start; f < end; ++f) {
-        long s;
-        if (deck->wav.channels == 1) {
-            s = deck->wav.samples[f];
-        } else {
-            long l = deck->wav.samples[(f * 2) + 0];
-            long r = deck->wav.samples[(f * 2) + 1];
-            s = (l + r) / 2;
+    if (end > wav->frame_count) end = wav->frame_count;
+
+    pos = start;
+    while (pos < end) {
+        unsigned long n = end - pos;
+        unsigned long f;
+        if (n > G3_WAVE_SCAN_BLOCK_FRAMES) n = G3_WAVE_SCAN_BLOCK_FRAMES;
+        if (!g3_wav_read_pcm_at(wav, pos, n, block)) break;
+        for (f = 0; f < n; ++f) {
+            long s;
+            if (wav->channels == 1) {
+                s = block[f];
+            } else {
+                long l = block[(f * 2) + 0];
+                long r = block[(f * 2) + 1];
+                s = (l + r) / 2;
+            }
+            if (s < mn) mn = s;
+            if (s > mx) mx = s;
         }
-        if (s < mn) mn = s;
-        if (s > mx) mx = s;
+        pos += n;
     }
     if (mn > mx) {
         mn = 0;
@@ -1702,6 +2259,15 @@ static void RebuildWaveformBucket(int deck_index, int point_index) {
 static void StartWaveformRebuild(int deck_index) {
     int i;
     if (deck_index < 0 || deck_index >= G3_DECK_COUNT) return;
+    if (TryLoadWaveformCache(deck_index)) {
+        gWaveRebuildDeck = -1;
+        gWaveRebuildNext = 0;
+        if (deck_index == gUiDeck) {
+            MarkWaveformDirty();
+            DrawWaveformBody();
+        }
+        return;
+    }
     for (i = 0; i < WAVE_POINTS; ++i) {
         gWaveMin[deck_index][i] = 0;
         gWaveMax[deck_index][i] = 0;
@@ -1722,6 +2288,7 @@ static int AdvanceWaveformRebuild(int max_points) {
         int done_deck = gWaveRebuildDeck;
         gWaveRebuildDeck = -1;
         gWaveRebuildNext = 0;
+        SaveWaveformCache(done_deck);
         if (done_deck == gUiDeck) {
             MarkWaveformDirty();
             DrawWaveformBody();
@@ -1813,6 +2380,7 @@ static void UpdateWaveformPlayhead(void) {
 static int LoadDeckFromFSSpec(int deck_index, const FSSpec* spec) {
     short refNum;
     long readCount;
+    long dataPos;
     OSErr err;
     char id[4];
     unsigned char le4[4];
@@ -1824,8 +2392,8 @@ static int LoadDeckFromFSSpec(int deck_index, const FSSpec* spec) {
     unsigned short fmtBits = 0;
     int gotFmt = 0;
     int gotData = 0;
-    short* pcm = NULL;
     unsigned long pcmBytes = 0;
+    unsigned long dataOffset = 0;
     G3Deck* deck;
     if (deck_index < 0 || deck_index >= G3_DECK_COUNT || spec == NULL) return 0;
     deck = &gPlayer.decks[deck_index];
@@ -1881,46 +2449,42 @@ static int LoadDeckFromFSSpec(int deck_index, const FSSpec* spec) {
             }
             gotFmt = 1;
         } else if (memcmp(id, "data", 4) == 0) {
+            err = GetFPos(refNum, &dataPos);
+            if (err != noErr) break;
             pcmBytes = chunkSize;
-            pcm = (short*)malloc((size_t)pcmBytes);
-            if (!pcm) {
-                FSClose(refNum);
-                snprintf(gLastMessage, sizeof(gLastMessage), "Deck %d load failed: out of memory.", deck_index + 1);
-                return 0;
-            }
-            snprintf(gLastMessage, sizeof(gLastMessage), "Deck %d: reading audio...", deck_index + 1);
-            gPrevMsgInit = 0;
-            UiPumpEvents();
-            err = ReadFileBytesWithPump(refNum, pcm, pcmBytes);
-            if (err != noErr) {
-                free(pcm);
-                FSClose(refNum);
-                snprintf(gLastMessage, sizeof(gLastMessage), "Deck %d load failed: data read error %d.", deck_index + 1, (int)err);
-                return 0;
-            }
+            dataOffset = (unsigned long)dataPos;
+            SetFPos(refNum, fsFromMark, (long)chunkSize);
             gotData = 1;
         } else {
             SetFPos(refNum, fsFromMark, (long)chunkSize);
         }
         if (chunkSize & 1u) SetFPos(refNum, fsFromMark, 1L);
     }
-    FSClose(refNum);
 
     if (!gotFmt || !gotData || fmtAudio != 1 || (fmtChannels != 1 && fmtChannels != 2) || fmtBits != 16 || fmtRate != 44100UL) {
-        free(pcm);
+        FSClose(refNum);
         snprintf(gLastMessage, sizeof(gLastMessage), "Deck %d load failed: needs PCM16 44.1k mono/stereo.", deck_index + 1);
         return 0;
     }
 
-    snprintf(gLastMessage, sizeof(gLastMessage), "Deck %d: preparing audio...", deck_index + 1);
-    gPrevMsgInit = 0;
-    UiPumpEvents();
-    g3_pcm16_le_to_host_yield(pcm, pcmBytes);
-
     FreeDeckSamplesSafe(deck_index, deck);
-    deck->wav.samples = pcm;
+    deck->wav.backend = G3_WAV_FILE;
+    deck->wav.refNum = refNum;
+    deck->wav.scanRefNum = -1;
+    err = FSpOpenDF(spec, fsRdPerm, &deck->wav.scanRefNum);
+    if (err != noErr) {
+        deck->wav.scanRefNum = -1;
+    }
+    deck->wav.stdio_file = NULL;
+    deck->wav.data_offset = dataOffset;
+    deck->wav.pcm_bytes = pcmBytes;
     deck->wav.channels = (int)fmtChannels;
     deck->wav.frame_count = pcmBytes / (unsigned long)(fmtChannels * 2);
+    if (!g3_wav_open_ring(&deck->wav)) {
+        g3_wav_close(&deck->wav);
+        snprintf(gLastMessage, sizeof(gLastMessage), "Deck %d load failed: out of memory.", deck_index + 1);
+        return 0;
+    }
     deck->loaded = 1;
     deck->state = G3_TRANSPORT_STOPPED;
     deck->frame_pos = 0.0;
@@ -2270,6 +2834,8 @@ static void HandleDeckButtons(ControlHandle ctrl) {
         else if (fr > 0)
             snprintf(gLastMessage, sizeof(gLastMessage), "Deck %d freeze @ %lu ms.", gUiDeck + 1,
                      (unsigned long)((1000.0 * gPlayer.decks[gUiDeck].frame_pos) / (double)G3_SAMPLE_RATE));
+        else if (fr == 2)
+            snprintf(gLastMessage, sizeof(gLastMessage), "Deck %d still unfading — wait a moment.", gUiDeck + 1);
         else
             snprintf(gLastMessage, sizeof(gLastMessage), "Deck %d unfrozen, playing.", gUiDeck + 1);
         gPrevDeckStat[0] = '\0';
@@ -2387,8 +2953,13 @@ static void DoUpdate(EventRecord* event) {
 
 static void InitUI(void) {
     Rect wr;
-    SetRect(&wr, 40, 40, 40 + WINDOW_W, 40 + WINDOW_H);
-    gWindow = NewWindow(NULL, &wr, "\pG3 Stage Player v26", true, zoomDocProc, (WindowPtr)-1, true, 0);
+    short winLeft;
+    short winTop;
+    winLeft = (short)((TARGET_SCREEN_W - WINDOW_W) / 2);
+    winTop = (short)((TARGET_SCREEN_H - WINDOW_H) / 2);
+    if (winTop < 20) winTop = 20;
+    SetRect(&wr, winLeft, winTop, (short)(winLeft + WINDOW_W), (short)(winTop + WINDOW_H));
+    gWindow = NewWindow(NULL, &wr, "\pG3 Stage Player v32", true, zoomDocProc, (WindowPtr)-1, true, 0);
     SetPort(gWindow);
     EraseRect(&gWindow->portRect);
     LayoutUI();
@@ -2430,7 +3001,10 @@ int main(void) {
     InitAudio();
 
     while (gRunning) {
+        int di;
         SyncVisibleDeckAndMaster();
+        for (di = 0; di < G3_DECK_COUNT; ++di)
+            g3_wav_pump_deck(&gPlayer.decks[di]);
         if (WaitNextEvent(everyEvent, &event, 2, NULL)) {
             switch (event.what) {
                 case mouseDown: DoMouseDown(&event); break;
@@ -2439,7 +3013,9 @@ int main(void) {
             }
         }
         gUiTickCounter++;
-        if (gWaveRebuildDeck >= 0) AdvanceWaveformRebuild(8);
+        if (gWaveRebuildDeck >= 0) AdvanceWaveformRebuild(G3_WAVE_REBUILD_CHUNK);
+        for (di = 0; di < G3_DECK_COUNT; ++di)
+            g3_wav_pump_deck(&gPlayer.decks[di]);
         if (gWaveformBodyDirty)
             DrawWaveformBody();
         else if (AnyDeckPlaying() && (gUiTickCounter % 2) == 0)
