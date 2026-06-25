@@ -1,6 +1,6 @@
 # CPU Monitor
 
-Lightweight CPU load meter for development on real G3 hardware — baseline calibration, smoothed history, and an on-screen bar while profiling the other apps.
+System-wide CPU load meter for development on real G3 hardware. Samples Process Manager `processActiveTime` across all running processes for accurate, low-overhead utilization with smoothed and peak readouts.
 
 ## Build
 
